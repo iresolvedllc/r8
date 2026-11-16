@@ -1,13 +1,15 @@
 //! R8 runtime: compiles the front-end output and crosses the Keel ABI.
 
 use r8_abi::Value;
-use r8_front::{ParseError, compile, compile_program, parse, parse_program};
+use r8_front::{CompileError, ParseError, compile, compile_program, parse, parse_program};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum EvalError {
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
+    #[error("compile error: {0}")]
+    Compile(#[from] CompileError),
     #[error("result is not an integer")]
     NotAnInteger,
 }
@@ -15,17 +17,18 @@ pub enum EvalError {
 /// Evaluates a single expression and returns the resulting value.
 pub fn eval(source: &str) -> Result<Value, EvalError> {
     let expression = parse(source)?;
-    let instructions = compile(&expression);
+    let instructions = compile(&expression)?;
     // SAFETY: the bytecode is a valid instruction stream for the machine.
     let value = unsafe { r8_abi::r8_machine_run(instructions.as_ptr(), instructions.len()) };
     Ok(value)
 }
 
-/// Evaluates a program (semicolon-separated expression statements) and
-/// returns the value of the final statement.
+/// Evaluates a program (a sequence of statements) and returns the value of
+/// the final expression statement, or `undefined` for programs that end
+/// with any other statement.
 pub fn eval_program(source: &str) -> Result<Value, EvalError> {
     let program = parse_program(source)?;
-    let instructions = compile_program(&program);
+    let instructions = compile_program(&program)?;
     // SAFETY: the bytecode is a valid instruction stream for the machine.
     let value = unsafe { r8_abi::r8_machine_run(instructions.as_ptr(), instructions.len()) };
     Ok(value)
@@ -74,7 +77,70 @@ mod tests {
             eval_program("console.log(1);").unwrap().to_string(),
             "undefined"
         );
-        assert!(eval_program("").unwrap().to_string() == "undefined");
+        assert_eq!(eval_program("").unwrap().to_string(), "undefined");
+    }
+
+    #[test]
+    fn evaluates_variables_and_loops() {
+        assert_eq!(
+            eval_program("let i = 0; let total = 0; while (i < 5) { total += i; i += 1; } total")
+                .unwrap()
+                .to_string(),
+            "10"
+        );
+        assert_eq!(
+            eval_program("let total = 0; for (let i = 0; i < 10; i += 1) { total += i; } total")
+                .unwrap()
+                .to_string(),
+            "45"
+        );
+        assert_eq!(
+            eval_program("let x = 0; if (2 > 1) { x = 10; } else { x = 20; } x")
+                .unwrap()
+                .to_string(),
+            "10"
+        );
+        assert_eq!(
+            eval_program("let x = 0; if (1 > 2) { x = 10; } else { x = 20; } x")
+                .unwrap()
+                .to_string(),
+            "20"
+        );
+        // Shadowing: the inner x lives in its own slot.
+        assert_eq!(
+            eval_program("let x = 1; { let x = 2; } x")
+                .unwrap()
+                .to_string(),
+            "1"
+        );
+        // Assignments are expressions producing the assigned value.
+        assert_eq!(
+            eval_program("let x = 0; let y = (x = 5) + 1; y")
+                .unwrap()
+                .to_string(),
+            "6"
+        );
+        // Uninitialized locals read as undefined.
+        assert_eq!(eval_program("let z; z").unwrap().to_string(), "undefined");
+        // Short-circuit: the deciding operand is the result.
+        assert_eq!(eval_program("0 && 5").unwrap().to_string(), "0");
+        assert_eq!(eval_program("2 && 5").unwrap().to_string(), "5");
+        assert_eq!(eval_program("0 || 7").unwrap().to_string(), "7");
+        assert_eq!(eval_program("2 || 7").unwrap().to_string(), "2");
+        assert_eq!(
+            eval_program("false && (1 / 0)").unwrap().to_string(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn reports_compile_errors() {
+        assert!(matches!(
+            eval("x").unwrap_err(),
+            EvalError::Compile(r8_front::CompileError::Undeclared(_))
+        ));
+        assert!(eval_program("const x = 1; x = 2;").is_err());
+        assert!(eval_program("let x = x;").is_err());
     }
 
     #[test]

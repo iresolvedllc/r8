@@ -1,12 +1,16 @@
 //! Keel: the versioned C ABI shared by the Rust language layer and the Zig
 //! machine layer.
 //!
-//! ABI v2 adds doubles (`TAG_FLOAT`, bit-packed into the `i64` payload),
+//! ABI v2 added doubles (`TAG_FLOAT`, bit-packed into the `i64` payload),
 //! booleans, null/undefined, the arithmetic/comparison opcode set, the
 //! `console.log` print intrinsic, and cross-language constant conformance
 //! probes used to prove the hand-mirrored `zig/src/abi.zig` cannot drift.
+//!
+//! ABI v3 adds locals (`OP_GET_LOCAL`/`OP_SET_LOCAL`), stack duplication,
+//! and absolute-index jumps for control flow (`if`/`else`, `while`, `for`,
+//! and short-circuit `&&`/`||`).
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Value tags. `CONFORMANCE_TAGS` lists these in a canonical order; keep both
 /// in sync with `zig/src/abi.zig`.
@@ -52,6 +56,20 @@ pub const OP_LOAD_UNDEFINED: u32 = 22;
 pub const OP_PRINT: u32 = 23;
 pub const OP_POP: u32 = 24;
 
+/// Duplicates the top of the stack (for `&&`/`||`, whose conditional jumps
+/// pop the condition but must leave the deciding value behind).
+pub const OP_DUP: u32 = 25;
+/// Pushes the value of local slot `operand`.
+pub const OP_GET_LOCAL: u32 = 26;
+/// Pops a value and stores it into local slot `operand`.
+pub const OP_SET_LOCAL: u32 = 27;
+/// Jumps to absolute instruction index `operand`.
+pub const OP_JMP: u32 = 28;
+/// Pops the condition; jumps to `operand` when it is falsy.
+pub const OP_JMP_IF_FALSE: u32 = 29;
+/// Pops the condition; jumps to `operand` when it is truthy.
+pub const OP_JMP_IF_TRUE: u32 = 30;
+
 /// Canonical tag order mirrored by `zig/src/abi.zig` for conformance probes.
 pub const CONFORMANCE_TAGS: &[u32] = &[
     TAG_INT,
@@ -63,6 +81,7 @@ pub const CONFORMANCE_TAGS: &[u32] = &[
 ];
 
 /// Canonical opcode order mirrored by `zig/src/abi.zig` for conformance probes.
+/// New opcodes are appended at the end so existing indices stay stable.
 pub const CONFORMANCE_OPS: &[u32] = &[
     OP_LOAD_INT,
     OP_ADD,
@@ -89,6 +108,12 @@ pub const CONFORMANCE_OPS: &[u32] = &[
     OP_LOAD_UNDEFINED,
     OP_PRINT,
     OP_POP,
+    OP_DUP,
+    OP_GET_LOCAL,
+    OP_SET_LOCAL,
+    OP_JMP,
+    OP_JMP_IF_FALSE,
+    OP_JMP_IF_TRUE,
 ];
 
 #[repr(C)]
@@ -300,6 +325,50 @@ impl Instruction {
         Self {
             op: OP_POP,
             operand: 0,
+        }
+    }
+
+    pub const fn dup() -> Self {
+        Self {
+            op: OP_DUP,
+            operand: 0,
+        }
+    }
+
+    pub const fn get_local(slot: usize) -> Self {
+        Self {
+            op: OP_GET_LOCAL,
+            operand: slot as i32,
+        }
+    }
+
+    pub const fn set_local(slot: usize) -> Self {
+        Self {
+            op: OP_SET_LOCAL,
+            operand: slot as i32,
+        }
+    }
+
+    /// Jumps carry absolute instruction indices; the compiler patches the
+    /// operand after emitting the target.
+    pub const fn jmp(target: usize) -> Self {
+        Self {
+            op: OP_JMP,
+            operand: target as i32,
+        }
+    }
+
+    pub const fn jmp_if_false(target: usize) -> Self {
+        Self {
+            op: OP_JMP_IF_FALSE,
+            operand: target as i32,
+        }
+    }
+
+    pub const fn jmp_if_true(target: usize) -> Self {
+        Self {
+            op: OP_JMP_IF_TRUE,
+            operand: target as i32,
         }
     }
 

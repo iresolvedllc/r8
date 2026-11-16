@@ -12,13 +12,14 @@ tier) without porting any of its code.
 
 ## Status
 
-Phase 1: the expression language. R8 evaluates JavaScript **expressions** with
-full operator precedence — arithmetic, comparison, equality, unary operators,
-float literals, boolean/null/undefined literals, and a `console.log`
-intrinsic. Numbers follow JS semantics (integer fast path, double promotion,
-IEEE division) and print exactly like JS `Number::toString`.
+Phase 2: statements. On top of the full Phase 1 expression language, R8 now
+evaluates **programs**: `let`/`const`/`var` declarations, assignment
+(including compound forms), blocks, `if`/`else`, `while`, `for`, and
+short-circuit `&&`/`||`. The compiler is scope-aware — each declaration gets
+its own local slot, so block shadowing works, and control flow compiles to
+absolute-index jumps patched at compile time.
 
-Not yet: variables, control flow, functions, strings, objects/arrays
+Not yet: functions, strings, objects/arrays, `break`/`continue`
 (see the roadmap).
 
 ## Usage
@@ -27,6 +28,7 @@ Not yet: variables, control flow, functions, strings, objects/arrays
 cargo run -p r8-cli -- eval "2 + 3 * 4"      # 14
 cargo run -p r8-cli -- eval "0.1 + 0.2"      # 0.30000000000000004
 cargo run -p r8-cli -- eval "1 / 0"          # Infinity
+cargo run -p r8-cli -- eval "0 || 7"         # 7 (short-circuit)
 cargo run -p r8-cli -- run tests/smoke/arith.js
 cargo run -p r8-cli -- selftest              # runtime ABI + eval smoke test
 ```
@@ -78,13 +80,19 @@ zig test zig/src/root.zig
 - **`console.log` is an intrinsic.** It compiles to `OP_PRINT` and is
   implemented inside the machine. It will be replaced by a proper host
   function mechanism (via `r8-core` host hooks) once calls exist.
+- **Jumps and locals.** `if`/`else`/`while`/`for` compile to absolute-index
+  jumps (`OP_JMP`, `OP_JMP_IF_FALSE`, `OP_JMP_IF_TRUE`) whose targets are
+  patched once known; `&&`/`||` use `OP_DUP` plus conditional jumps so the
+  deciding operand stays on the stack. Every declaration owns a distinct
+  local slot, which makes block shadowing free at runtime; `let x = x` is
+  rejected at compile time (a TDZ approximation until full TDZ checks land).
 
 ## Roadmap
 
 | Phase | Milestone | Fixture gate |
 |---|---|---|
-| 1 | expression language + doubles | `tests/smoke/arith.js` |
-| 2 | variables (`let`/`const`) + control flow (`if`/`while`/`for`) | — |
+| 1 ✅ | expression language + doubles | `tests/smoke/arith.js` |
+| 2 ✅ | variables, assignment, control flow, `&&`/`\|\|` | — |
 | 3 | strings, template literals, host built-ins | `tests/smoke/strings.js` |
 | 4 | functions, calls, closures | — |
 | 5 | arrays, objects, property access | `tests/smoke/array.js` |

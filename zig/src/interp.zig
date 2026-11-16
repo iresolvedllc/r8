@@ -7,6 +7,23 @@ const abi = @import("abi.zig");
 /// path and promote to doubles on overflow, float operands, or division;
 /// comparisons are numeric; equality distinguishes loose from strict;
 /// every value prints exactly like JS `Number::toString` / `String()`.
+///
+/// Locals are a flat array of slots; the compiler gives every declaration
+/// its own slot (block shadowing then needs no runtime save/restore) and
+/// pads slots with `undefined` so uninitialized reads are JS-shaped.
+
+const LOCAL_COUNT = 256;
+
+fn localSlot(operand: i32) usize {
+    const slot: usize = @intCast(operand);
+    if (slot >= LOCAL_COUNT) @panic("local slot out of range");
+    return slot;
+}
+
+fn jumpTarget(operand: i32) usize {
+    if (operand < 0) @panic("jump target out of range");
+    return @intCast(operand);
+}
 
 const Stack = struct {
     values: [256]abi.Value = undefined,
@@ -36,8 +53,13 @@ const Equality = enum { loose, strict };
 
 pub fn run(instructions: []const abi.Instruction) abi.Value {
     var stack: Stack = .{};
+    var locals: [LOCAL_COUNT]abi.Value = undefined;
+    for (&locals) |*slot| slot.* = abi.Value.UNDEF;
+    var pc: usize = 0;
 
-    for (instructions) |instruction| {
+    while (pc < instructions.len) {
+        const instruction = instructions[pc];
+        pc += 1;
         switch (instruction.op) {
             abi.OP_LOAD_INT => stack.push(abi.Value.fromInt(instruction.operand)),
             // The raw high half of a float literal, pushed as ordinary data.
@@ -91,6 +113,24 @@ pub fn run(instructions: []const abi.Instruction) abi.Value {
                 stack.push(abi.Value.UNDEF);
             },
             abi.OP_POP => _ = stack.pop(),
+
+            abi.OP_DUP => {
+                const value = stack.pop();
+                stack.push(value);
+                stack.push(value);
+            },
+            abi.OP_GET_LOCAL => stack.push(locals[localSlot(instruction.operand)]),
+            abi.OP_SET_LOCAL => locals[localSlot(instruction.operand)] = stack.pop(),
+
+            abi.OP_JMP => pc = jumpTarget(instruction.operand),
+            abi.OP_JMP_IF_FALSE => {
+                const condition = stack.pop();
+                if (!isTruthy(condition)) pc = jumpTarget(instruction.operand);
+            },
+            abi.OP_JMP_IF_TRUE => {
+                const condition = stack.pop();
+                if (isTruthy(condition)) pc = jumpTarget(instruction.operand);
+            },
 
             abi.OP_RETURN => return stack.top(),
             else => @panic("unknown opcode"),
@@ -504,6 +544,62 @@ test "print pops and leaves undefined" {
     };
     const value = run(&instructions);
     try std.testing.expectEqual(abi.TAG_UNDEFINED, value.tag);
+}
+
+test "locals round trip and default to undefined" {
+    const set_get = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_INT, .operand = 5 },
+        .{ .op = abi.OP_SET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    try std.testing.expectEqual(@as(?i64, 5), run(&set_get).asInt());
+
+    const read_default = [_]abi.Instruction{
+        .{ .op = abi.OP_GET_LOCAL, .operand = 7 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&read_default);
+    try std.testing.expectEqual(abi.TAG_UNDEFINED, value.tag);
+}
+
+test "dup duplicates the top of the stack" {
+    const instructions = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_DUP, .operand = 0 },
+        .{ .op = abi.OP_ADD, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    try std.testing.expectEqual(@as(?i64, 2), run(&instructions).asInt());
+}
+
+test "jumps control the program counter" {
+    // Skip the poison value.
+    const jmp = [_]abi.Instruction{
+        .{ .op = abi.OP_JMP, .operand = 3 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 99 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 7 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    try std.testing.expectEqual(@as(?i64, 7), run(&jmp).asInt());
+
+    // Conditional jump taken on a falsy condition only.
+    const branch = struct {
+        fn call(condition: i64, expected: i64) !void {
+            const instructions = [_]abi.Instruction{
+                .{ .op = abi.OP_LOAD_INT, .operand = @intCast(condition) },
+                .{ .op = abi.OP_JMP_IF_FALSE, .operand = 4 },
+                .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+                .{ .op = abi.OP_JMP, .operand = 5 },
+                .{ .op = abi.OP_LOAD_INT, .operand = 0 },
+                .{ .op = abi.OP_RETURN, .operand = 0 },
+            };
+            try std.testing.expectEqual(@as(?i64, expected), run(&instructions).asInt());
+        }
+    }.call;
+    try branch(1, 1); // truthy: falls through
+    try branch(0, 0); // falsy: jumps
 }
 
 test "formatValue matches js string conversion" {
