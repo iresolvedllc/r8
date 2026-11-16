@@ -1,7 +1,8 @@
-//! R8 embedder API. The vertical slice exposes evaluation and ABI identity.
+//! R8 embedder API. Exposes evaluation (expressions and programs) and ABI
+//! identity.
 
 pub use r8_abi::{ABI_VERSION, Value};
-pub use r8_runtime::{EvalError, eval, eval_i64};
+pub use r8_runtime::{EvalError, eval, eval_i64, eval_program};
 
 pub struct Engine;
 
@@ -10,8 +11,14 @@ impl Engine {
         Self
     }
 
-    pub fn eval(&self, source: &str) -> Result<i64, EvalError> {
-        eval_i64(source)
+    /// Evaluates a single expression, returning the value in its JS type.
+    pub fn eval(&self, source: &str) -> Result<Value, EvalError> {
+        eval(source)
+    }
+
+    /// Evaluates a program of expression statements.
+    pub fn eval_program(&self, source: &str) -> Result<Value, EvalError> {
+        eval_program(source)
     }
 }
 
