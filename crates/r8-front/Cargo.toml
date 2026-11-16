@@ -1,0 +1,10 @@
+[package]
+name = "r8-front"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+r8-abi = { path = "../r8-abi" }
+thiserror.workspace = true

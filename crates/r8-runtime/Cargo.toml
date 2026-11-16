@@ -1,0 +1,11 @@
+[package]
+name = "r8-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+r8-abi = { path = "../r8-abi" }
+r8-front = { path = "../r8-front" }
+thiserror.workspace = true
