@@ -6,11 +6,16 @@
 //! `console.log` print intrinsic, and cross-language constant conformance
 //! probes used to prove the hand-mirrored `zig/src/abi.zig` cannot drift.
 //!
-//! ABI v3 adds locals (`OP_GET_LOCAL`/`OP_SET_LOCAL`), stack duplication,
+//! ABI v3 added locals (`OP_GET_LOCAL`/`OP_SET_LOCAL`), stack duplication,
 //! and absolute-index jumps for control flow (`if`/`else`, `while`, `for`,
 //! and short-circuit `&&`/`||`).
+//!
+//! ABI v4 adds strings: `TAG_STRING` (payload points at a `KeelString` in
+//! machine-owned memory), the string-constant pool passed to a widened
+//! `r8_machine_run` signature, `OP_LOAD_STRING` (pool index operand), and
+//! `OP_TO_STRING` for template-literal substitution.
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// Value tags. `CONFORMANCE_TAGS` lists these in a canonical order; keep both
 /// in sync with `zig/src/abi.zig`.
@@ -20,6 +25,7 @@ pub const TAG_FLOAT: u32 = 3;
 pub const TAG_BOOL: u32 = 4;
 pub const TAG_NULL: u32 = 5;
 pub const TAG_UNDEFINED: u32 = 6;
+pub const TAG_STRING: u32 = 7;
 
 /// Opcodes. `CONFORMANCE_OPS` lists these in a canonical order; keep both in
 /// sync with `zig/src/abi.zig`.
@@ -69,8 +75,16 @@ pub const OP_JMP: u32 = 28;
 pub const OP_JMP_IF_FALSE: u32 = 29;
 /// Pops the condition; jumps to `operand` when it is truthy.
 pub const OP_JMP_IF_TRUE: u32 = 30;
+/// Pushes a copy of string constant `operand` from the pool. The machine
+/// copies the bytes into its own arena, so the pool only needs to outlive
+/// the call.
+pub const OP_LOAD_STRING: u32 = 31;
+/// Pops a value and pushes its JS `String()` rendering as a string value
+/// (used by template-literal substitutions).
+pub const OP_TO_STRING: u32 = 32;
 
 /// Canonical tag order mirrored by `zig/src/abi.zig` for conformance probes.
+/// New tags are appended at the end so existing indices stay stable.
 pub const CONFORMANCE_TAGS: &[u32] = &[
     TAG_INT,
     TAG_OBJECT,
@@ -78,6 +92,7 @@ pub const CONFORMANCE_TAGS: &[u32] = &[
     TAG_BOOL,
     TAG_NULL,
     TAG_UNDEFINED,
+    TAG_STRING,
 ];
 
 /// Canonical opcode order mirrored by `zig/src/abi.zig` for conformance probes.
@@ -114,6 +129,8 @@ pub const CONFORMANCE_OPS: &[u32] = &[
     OP_JMP,
     OP_JMP_IF_FALSE,
     OP_JMP_IF_TRUE,
+    OP_LOAD_STRING,
+    OP_TO_STRING,
 ];
 
 #[repr(C)]
@@ -172,6 +189,49 @@ impl Value {
     pub fn as_bool(self) -> Option<bool> {
         (self.tag == TAG_BOOL).then_some(self.payload != 0)
     }
+
+    /// Resolves a string value's bytes. The returned slice points into
+    /// machine-owned memory and is valid until the next `r8_machine_run`
+    /// resets the machine's arena (pool constants live for the process
+    /// lifetime).
+    pub fn as_str(&self) -> Option<&'static str> {
+        if self.tag != TAG_STRING {
+            return None;
+        }
+        // SAFETY: the payload was produced by `string_literal` or by the
+        // machine's string arena; both keep the `KeelString` and its bytes
+        // alive as documented above.
+        let keel_string = unsafe { &*(self.payload as *const KeelString) };
+        let bytes = unsafe { std::slice::from_raw_parts(keel_string.ptr, keel_string.len) };
+        std::str::from_utf8(bytes).ok()
+    }
+}
+
+/// A borrowed string in memory owned by whoever created the value (the Rust
+/// pool for constants, the machine's arena for runtime values).
+#[repr(C)]
+pub struct KeelString {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl Value {
+    /// Builds a pool constant for `bytes`. The bytes are copied and leaked:
+    /// pool constants intentionally live for the process lifetime, which is
+    /// fine for compile-per-run embedders and revisited with the GC
+    /// (Phase 6).
+    pub fn string_literal(bytes: &str) -> Self {
+        let data = Box::leak(bytes.as_bytes().to_vec().into_boxed_slice());
+        let keel_string = Box::leak(Box::new(KeelString {
+            ptr: data.as_ptr(),
+            len: data.len(),
+        }));
+        Self {
+            tag: TAG_STRING,
+            _pad: 0,
+            payload: keel_string as *const KeelString as i64,
+        }
+    }
 }
 
 // SAFETY notes: `Value` crosses the FFI boundary by value in `r8_machine_run`
@@ -185,6 +245,10 @@ impl std::fmt::Display for Value {
             TAG_BOOL => f.write_str(if self.payload != 0 { "true" } else { "false" }),
             TAG_NULL => f.write_str("null"),
             TAG_UNDEFINED => f.write_str("undefined"),
+            TAG_STRING => match self.as_str() {
+                Some(text) => f.write_str(text),
+                None => f.write_str("<string>"),
+            },
             // Placeholder until objects exist (Phase 5).
             TAG_OBJECT => f.write_str("[object]"),
             _ => write!(f, "<value tag={}>", self.tag),
@@ -314,6 +378,13 @@ impl Instruction {
         }
     }
 
+    pub const fn load_string(index: usize) -> Self {
+        Self {
+            op: OP_LOAD_STRING,
+            operand: index as i32,
+        }
+    }
+
     pub const fn print() -> Self {
         Self {
             op: OP_PRINT,
@@ -386,7 +457,17 @@ impl Instruction {
 
 unsafe extern "C" {
     pub fn r8_abi_version() -> u32;
-    pub fn r8_machine_run(instructions: *const Instruction, len: usize) -> Value;
+    /// Runs bytecode with a constant pool. Pool entries referenced by
+    /// `OP_LOAD_STRING` (tag `TAG_STRING`) are copied into the machine's
+    /// arena when loaded, so the pool only needs to outlive the call.
+    /// Returned string values point into the machine's arena and are valid
+    /// until the next call resets it.
+    pub fn r8_machine_run(
+        instructions: *const Instruction,
+        len: usize,
+        pool: *const Value,
+        pool_len: usize,
+    ) -> Value;
 
     /// Conformance probes exported by `zig/src/abi.zig`: the Zig machine
     /// reports its tag/opcode tables so the Rust side can prove both halves
@@ -421,6 +502,15 @@ mod tests {
         assert_eq!(Value::float(0.5).as_float(), Some(0.5));
         assert_eq!(Value::float(-2.75).as_float(), Some(-2.75));
         assert_eq!(Value::float(f64::INFINITY).as_float(), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn string_literal_round_trip() {
+        let value = Value::string_literal("hello");
+        assert_eq!(value.as_str(), Some("hello"));
+        assert_eq!(value.as_int(), None);
+        assert_eq!(value.to_string(), "hello");
+        assert_eq!(Value::string_literal("héllo ✓").as_str(), Some("héllo ✓"));
     }
 
     #[test]

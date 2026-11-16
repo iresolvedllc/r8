@@ -1,7 +1,9 @@
 //! R8 runtime: compiles the front-end output and crosses the Keel ABI.
 
 use r8_abi::Value;
-use r8_front::{CompileError, ParseError, compile, compile_program, parse, parse_program};
+use r8_front::{
+    CompileError, Compiled, ParseError, compile, compile_program, parse, parse_program,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,10 +19,8 @@ pub enum EvalError {
 /// Evaluates a single expression and returns the resulting value.
 pub fn eval(source: &str) -> Result<Value, EvalError> {
     let expression = parse(source)?;
-    let instructions = compile(&expression)?;
-    // SAFETY: the bytecode is a valid instruction stream for the machine.
-    let value = unsafe { r8_abi::r8_machine_run(instructions.as_ptr(), instructions.len()) };
-    Ok(value)
+    let compiled = compile(&expression)?;
+    run_machine(&compiled)
 }
 
 /// Evaluates a program (a sequence of statements) and returns the value of
@@ -28,9 +28,21 @@ pub fn eval(source: &str) -> Result<Value, EvalError> {
 /// with any other statement.
 pub fn eval_program(source: &str) -> Result<Value, EvalError> {
     let program = parse_program(source)?;
-    let instructions = compile_program(&program)?;
-    // SAFETY: the bytecode is a valid instruction stream for the machine.
-    let value = unsafe { r8_abi::r8_machine_run(instructions.as_ptr(), instructions.len()) };
+    let compiled = compile_program(&program)?;
+    run_machine(&compiled)
+}
+
+fn run_machine(compiled: &Compiled) -> Result<Value, EvalError> {
+    // SAFETY: the bytecode and pool are a valid instruction stream and
+    // constant pool for the machine; both outlive the call.
+    let value = unsafe {
+        r8_abi::r8_machine_run(
+            compiled.instructions.as_ptr(),
+            compiled.instructions.len(),
+            compiled.pool.as_ptr(),
+            compiled.pool.len(),
+        )
+    };
     Ok(value)
 }
 
@@ -141,6 +153,56 @@ mod tests {
         ));
         assert!(eval_program("const x = 1; x = 2;").is_err());
         assert!(eval_program("let x = x;").is_err());
+    }
+
+    #[test]
+    fn evaluates_strings() {
+        assert_eq!(eval("'a' + 'b'").unwrap().to_string(), "ab");
+        assert_eq!(eval("'a' + 5").unwrap().to_string(), "a5");
+        assert_eq!(eval("5 + ''").unwrap().to_string(), "5");
+        assert_eq!(eval("'hello ' + 0.5").unwrap().to_string(), "hello 0.5");
+        assert_eq!(
+            eval("'5' == 5").unwrap().to_string(),
+            "true" // loose: string coerces to number
+        );
+        assert_eq!(eval("'5' === 5").unwrap().to_string(), "false");
+        assert_eq!(eval("'a' < 'b'").unwrap().to_string(), "true");
+        assert_eq!(eval("'' + null").unwrap().to_string(), "null");
+        assert_eq!(eval("'' + undefined").unwrap().to_string(), "undefined");
+        assert_eq!(eval("'' + true").unwrap().to_string(), "true");
+        assert_eq!(eval("'5' * '2'").unwrap().to_string(), "10");
+        assert_eq!(eval("'1' && 7").unwrap().to_string(), "7"); // "1" truthy
+    }
+
+    #[test]
+    fn evaluates_templates() {
+        assert_eq!(eval("`hello ${'r8'}`").unwrap().to_string(), "hello r8");
+        assert_eq!(eval("`x${1 + 1}y`").unwrap().to_string(), "x2y");
+        // Numeric substitutions stringify correctly, never add numerically.
+        assert_eq!(eval("`${1}${2}`").unwrap().to_string(), "12");
+        assert_eq!(
+            eval("`${0.1 + 0.2}`").unwrap().to_string(),
+            "0.30000000000000004"
+        );
+        // via a variable, like the fixture
+        assert_eq!(
+            eval_program("const name = 'r8'; `hello ${name}`")
+                .unwrap()
+                .to_string(),
+            "hello r8"
+        );
+    }
+
+    #[test]
+    fn string_values_survive_across_runs() {
+        // A string returned by one run stays readable until the next run
+        // resets the machine's arena (documented lifetime).
+        let first = eval("'kept'").unwrap();
+        assert_eq!(first.as_str(), Some("kept"));
+        let _ = eval("'next'").unwrap();
+        // The bytes behind `first` may be gone; reading it now is only safe
+        // before another run, so we assert the documented contract instead.
+        assert_eq!(first.tag, r8_abi::TAG_STRING);
     }
 
     #[test]

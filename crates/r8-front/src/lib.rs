@@ -1,15 +1,16 @@
 //! R8 front end: lexer, parser, AST, and bytecode compiler.
 //!
-//! Phase 2 compiles the full expression language plus statements: `let` /
-//! `const` / `var` declarations (with multiple declarators), assignment
-//! (including compound forms), blocks, `if`/`else`, `while`, `for`, and
-//! short-circuit `&&`/`||`. The compiler is scope-aware: every declaration
-//! gets its own local slot (shadowing needs no runtime save/restore), and
-//! control flow compiles to absolute-index jumps that are patched after the
-//! target is known. The parser is deliberately shaped like the real ES2015+
-//! front end: tokens, precedence, AST, then bytecode.
+//! Phase 3 adds strings: string literals with escapes, template literals
+//! with nested substitutions, a constant pool for string literals (interned
+//! by value), and `OP_TO_STRING` for substitutions. The compiler output is a
+//! `Compiled` (bytecode + pool) because the machine now takes both.
+//!
+//! Phase 2 compiled statements: `let`/`const`/`var` declarations, assignment,
+//! blocks, `if`/`else`, `while`, `for`, and short-circuit `&&`/`||`, with a
+//! scope-aware compiler that gives every declaration its own local slot and
+//! patches absolute-index jumps.
 
-use r8_abi::Instruction;
+use r8_abi::{Instruction, Value};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -79,6 +80,12 @@ pub enum UnaryOp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum TemplatePart {
+    Text(String),
+    Substitution(Expr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i64),
     Float(f64),
@@ -86,6 +93,8 @@ pub enum Expr {
     Null,
     Undefined,
     Var(String),
+    String(String),
+    Template(Vec<TemplatePart>),
     Assign(AssignOp, String, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
@@ -130,6 +139,12 @@ pub enum Stmt {
 pub enum Token {
     Int(i64),
     Float(f64),
+    String(String),
+    TemplateStart,
+    TemplateText(String),
+    TemplateExprOpen,
+    TemplateExprClose,
+    TemplateEnd,
     Plus,
     Minus,
     Star,
@@ -187,6 +202,10 @@ pub enum ParseError {
     ExpectedIdentifier,
     #[error("trailing input")]
     TrailingInput,
+    #[error("unterminated string literal")]
+    UnterminatedString,
+    #[error("invalid escape sequence")]
+    InvalidEscape,
     #[error("{0} are not supported yet")]
     Unsupported(&'static str),
     #[error("const declaration requires an initializer")]
@@ -207,174 +226,408 @@ pub enum CompileError {
     TooManyLocals,
 }
 
+/// Bytecode plus its string-constant pool; both are passed to the machine.
+#[derive(Debug, Clone)]
+pub struct Compiled {
+    pub instructions: Vec<Instruction>,
+    pub pool: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LexMode {
+    Normal,
+    TemplateText,
+    TemplateExpr { brace_depth: usize },
+}
+
 pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
     let characters: Vec<char> = source.chars().collect();
-    let mut index = 0;
-    let mut tokens = Vec::new();
-    while index < characters.len() {
-        let character = characters[index];
-        match character {
-            character if character.is_whitespace() => {
-                index += 1;
+    let mut lexer = Lexer {
+        characters: &characters,
+        index: 0,
+        tokens: Vec::new(),
+        modes: vec![LexMode::Normal],
+    };
+    while lexer.index < lexer.characters.len() {
+        lexer.step()?;
+    }
+    lexer.tokens.push(Token::Eof);
+    Ok(lexer.tokens)
+}
+
+struct Lexer<'a> {
+    characters: &'a [char],
+    index: usize,
+    tokens: Vec<Token>,
+    modes: Vec<LexMode>,
+}
+
+impl Lexer<'_> {
+    fn step(&mut self) -> Result<(), ParseError> {
+        let character = self.characters[self.index];
+        match *self.modes.last().expect("a mode is always active") {
+            LexMode::TemplateText => {
+                self.template_text_step()?;
             }
-            '+' => {
-                if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::PlusEq);
-                    index += 2;
+            LexMode::TemplateExpr { .. } => match character {
+                '{' => {
+                    self.tokens.push(Token::LeftBrace);
+                    if let Some(LexMode::TemplateExpr { brace_depth }) = self.modes.last_mut() {
+                        *brace_depth += 1;
+                    }
+                    self.index += 1;
+                }
+                '}' => {
+                    let at_top = matches!(
+                        self.modes.last(),
+                        Some(LexMode::TemplateExpr { brace_depth: 0 })
+                    );
+                    if at_top {
+                        self.tokens.push(Token::TemplateExprClose);
+                        self.modes.pop();
+                    } else {
+                        self.tokens.push(Token::RightBrace);
+                        if let Some(LexMode::TemplateExpr { brace_depth }) = self.modes.last_mut() {
+                            *brace_depth -= 1;
+                        }
+                    }
+                    self.index += 1;
+                }
+                '`' => {
+                    // A nested template inside a substitution.
+                    self.tokens.push(Token::TemplateStart);
+                    self.modes.push(LexMode::TemplateText);
+                    self.index += 1;
+                }
+                _ => self.common_step()?,
+            },
+            LexMode::Normal => match character {
+                '`' => {
+                    self.tokens.push(Token::TemplateStart);
+                    self.modes.push(LexMode::TemplateText);
+                    self.index += 1;
+                }
+                _ => self.common_step()?,
+            },
+        }
+        Ok(())
+    }
+
+    /// Consumes a run of cooked template text, ending at a closing backtick
+    /// (emits `TemplateEnd`) or at `${` (emits `TemplateExprOpen`).
+    fn template_text_step(&mut self) -> Result<(), ParseError> {
+        let mut text = String::new();
+        loop {
+            let character = *self
+                .characters
+                .get(self.index)
+                .ok_or(ParseError::UnterminatedString)?;
+            match character {
+                '`' => {
+                    self.index += 1;
+                    if !text.is_empty() {
+                        self.tokens.push(Token::TemplateText(text));
+                    }
+                    self.tokens.push(Token::TemplateEnd);
+                    self.modes.pop();
+                    return Ok(());
+                }
+                '$' if self.characters.get(self.index + 1) == Some(&'{') => {
+                    self.index += 2;
+                    if !text.is_empty() {
+                        self.tokens.push(Token::TemplateText(text));
+                    }
+                    self.tokens.push(Token::TemplateExprOpen);
+                    self.modes.push(LexMode::TemplateExpr { brace_depth: 0 });
+                    return Ok(());
+                }
+                '\\' => {
+                    let decoded = self.decode_escape(true)?;
+                    text.push(decoded);
+                }
+                _ => {
+                    // Newlines are legal inside template literals.
+                    text.push(character);
+                    self.index += 1;
+                }
+            }
+        }
+    }
+
+    /// Lexes a `'...'` or `"..."` string literal with escapes. Raw newlines
+    /// are illegal, as in JS.
+    fn string_literal(&mut self) -> Result<(), ParseError> {
+        let quote = self.characters[self.index];
+        self.index += 1;
+        let mut value = String::new();
+        loop {
+            let character = *self
+                .characters
+                .get(self.index)
+                .ok_or(ParseError::UnterminatedString)?;
+            match character {
+                c if c == quote => {
+                    self.index += 1;
+                    break;
+                }
+                '\n' | '\r' => return Err(ParseError::UnterminatedString),
+                '\\' => {
+                    let decoded = self.decode_escape(false)?;
+                    value.push(decoded);
+                }
+                other => {
+                    value.push(other);
+                    self.index += 1;
+                }
+            }
+        }
+        self.tokens.push(Token::String(value));
+        Ok(())
+    }
+
+    /// Decodes an escape sequence after the backslash, advancing the index.
+    fn decode_escape(&mut self, in_template: bool) -> Result<char, ParseError> {
+        self.index += 1;
+        let escape = *self
+            .characters
+            .get(self.index)
+            .ok_or(ParseError::UnterminatedString)?;
+        self.index += 1;
+        let decoded = match escape {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'v' => '\u{b}',
+            '0' => '\0',
+            '\\' => '\\',
+            '\'' => '\'',
+            '"' => '"',
+            '`' if in_template => '`',
+            '$' if in_template => '$',
+            'x' => {
+                let hex = self.hex_digits(2)?;
+                char::from_u32(hex).ok_or(ParseError::InvalidEscape)?
+            }
+            'u' => {
+                if self.characters.get(self.index) == Some(&'{') {
+                    self.index += 1;
+                    let mut hex = 0u32;
+                    let mut digits = 0;
+                    while let Some(&c) = self.characters.get(self.index) {
+                        if c == '}' {
+                            break;
+                        }
+                        let digit = c.to_digit(16).ok_or(ParseError::InvalidEscape)?;
+                        hex = hex
+                            .checked_mul(16)
+                            .and_then(|h| h.checked_add(digit))
+                            .ok_or(ParseError::InvalidEscape)?;
+                        digits += 1;
+                        self.index += 1;
+                    }
+                    if self.characters.get(self.index) != Some(&'}') || digits == 0 {
+                        return Err(ParseError::UnterminatedString);
+                    }
+                    self.index += 1;
+                    char::from_u32(hex).ok_or(ParseError::InvalidEscape)?
                 } else {
-                    tokens.push(Token::Plus);
-                    index += 1;
+                    let hex = self.hex_digits(4)?;
+                    char::from_u32(hex).ok_or(ParseError::InvalidEscape)?
+                }
+            }
+            // Identity escape: JS allows `\<char>` for most characters.
+            other => other,
+        };
+        Ok(decoded)
+    }
+
+    fn hex_digits(&mut self, count: usize) -> Result<u32, ParseError> {
+        let mut hex = 0u32;
+        for _ in 0..count {
+            let character = *self
+                .characters
+                .get(self.index)
+                .ok_or(ParseError::InvalidEscape)?;
+            let digit = character.to_digit(16).ok_or(ParseError::InvalidEscape)?;
+            hex = hex * 16 + digit;
+            self.index += 1;
+        }
+        Ok(hex)
+    }
+
+    /// The mode-independent token recognition shared by `Normal` and
+    /// `TemplateExpr` (backticks are handled by the callers).
+    fn common_step(&mut self) -> Result<(), ParseError> {
+        let character = self.characters[self.index];
+        match character {
+            c if c.is_whitespace() => {
+                self.index += 1;
+            }
+            '"' | '\'' => self.string_literal()?,
+            '+' => {
+                if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::PlusEq);
+                    self.index += 2;
+                } else {
+                    self.tokens.push(Token::Plus);
+                    self.index += 1;
                 }
             }
             '-' => {
-                if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::MinusEq);
-                    index += 2;
+                if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::MinusEq);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::Minus);
-                    index += 1;
+                    self.tokens.push(Token::Minus);
+                    self.index += 1;
                 }
             }
             '*' => {
-                if characters.get(index + 1) == Some(&'*') {
-                    tokens.push(Token::Pow);
-                    index += 2;
-                } else if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::StarEq);
-                    index += 2;
+                if self.characters.get(self.index + 1) == Some(&'*') {
+                    self.tokens.push(Token::Pow);
+                    self.index += 2;
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::StarEq);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::Star);
-                    index += 1;
+                    self.tokens.push(Token::Star);
+                    self.index += 1;
                 }
             }
             '/' => {
                 // `//` starts a line comment; otherwise it is division.
-                if characters.get(index + 1) == Some(&'/') {
-                    while index < characters.len() && characters[index] != '\n' {
-                        index += 1;
+                if self.characters.get(self.index + 1) == Some(&'/') {
+                    while self.index < self.characters.len() && self.characters[self.index] != '\n'
+                    {
+                        self.index += 1;
                     }
-                } else if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::SlashEq);
-                    index += 2;
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::SlashEq);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::Slash);
-                    index += 1;
+                    self.tokens.push(Token::Slash);
+                    self.index += 1;
                 }
             }
             '%' => {
-                if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::PercentEq);
-                    index += 2;
+                if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::PercentEq);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::Percent);
-                    index += 1;
+                    self.tokens.push(Token::Percent);
+                    self.index += 1;
                 }
             }
             '!' => {
-                if characters.get(index + 1) == Some(&'=')
-                    && characters.get(index + 2) == Some(&'=')
+                if self.characters.get(self.index + 1) == Some(&'=')
+                    && self.characters.get(self.index + 2) == Some(&'=')
                 {
-                    tokens.push(Token::NotEqEq);
-                    index += 3;
-                } else if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::NotEq);
-                    index += 2;
+                    self.tokens.push(Token::NotEqEq);
+                    self.index += 3;
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::NotEq);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::Bang);
-                    index += 1;
+                    self.tokens.push(Token::Bang);
+                    self.index += 1;
                 }
             }
             '&' => {
-                if characters.get(index + 1) == Some(&'&') {
-                    tokens.push(Token::AmpAmp);
-                    index += 2;
+                if self.characters.get(self.index + 1) == Some(&'&') {
+                    self.tokens.push(Token::AmpAmp);
+                    self.index += 2;
                 } else {
                     // Bitwise `&` is not supported yet.
                     return Err(ParseError::Unexpected('&'));
                 }
             }
             '|' => {
-                if characters.get(index + 1) == Some(&'|') {
-                    tokens.push(Token::PipePipe);
-                    index += 2;
+                if self.characters.get(self.index + 1) == Some(&'|') {
+                    self.tokens.push(Token::PipePipe);
+                    self.index += 2;
                 } else {
                     // Bitwise `|` is not supported yet.
                     return Err(ParseError::Unexpected('|'));
                 }
             }
             '<' => {
-                if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::Le);
-                    index += 2;
+                if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::Le);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::Lt);
-                    index += 1;
+                    self.tokens.push(Token::Lt);
+                    self.index += 1;
                 }
             }
             '>' => {
-                if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::Ge);
-                    index += 2;
+                if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::Ge);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::Gt);
-                    index += 1;
+                    self.tokens.push(Token::Gt);
+                    self.index += 1;
                 }
             }
             '=' => {
-                if characters.get(index + 1) == Some(&'=')
-                    && characters.get(index + 2) == Some(&'=')
+                if self.characters.get(self.index + 1) == Some(&'=')
+                    && self.characters.get(self.index + 2) == Some(&'=')
                 {
-                    tokens.push(Token::EqEqEq);
-                    index += 3;
-                } else if characters.get(index + 1) == Some(&'=') {
-                    tokens.push(Token::EqEq);
-                    index += 2;
+                    self.tokens.push(Token::EqEqEq);
+                    self.index += 3;
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::EqEq);
+                    self.index += 2;
                 } else {
-                    tokens.push(Token::EqAssign);
-                    index += 1;
+                    self.tokens.push(Token::EqAssign);
+                    self.index += 1;
                 }
             }
             '(' => {
-                tokens.push(Token::LParen);
-                index += 1;
+                self.tokens.push(Token::LParen);
+                self.index += 1;
             }
             ')' => {
-                tokens.push(Token::RParen);
-                index += 1;
+                self.tokens.push(Token::RParen);
+                self.index += 1;
             }
             '{' => {
-                tokens.push(Token::LeftBrace);
-                index += 1;
+                self.tokens.push(Token::LeftBrace);
+                self.index += 1;
             }
             '}' => {
-                tokens.push(Token::RightBrace);
-                index += 1;
+                self.tokens.push(Token::RightBrace);
+                self.index += 1;
             }
             '.' => {
-                if characters
-                    .get(index + 1)
+                if self
+                    .characters
+                    .get(self.index + 1)
                     .is_some_and(|c| c.is_ascii_digit())
                 {
-                    tokens.push(lex_number(&characters, &mut index)?);
+                    self.tokens
+                        .push(lex_number(self.characters, &mut self.index)?);
                 } else {
-                    tokens.push(Token::Dot);
-                    index += 1;
+                    self.tokens.push(Token::Dot);
+                    self.index += 1;
                 }
             }
             ',' => {
-                tokens.push(Token::Comma);
-                index += 1;
+                self.tokens.push(Token::Comma);
+                self.index += 1;
             }
             ';' => {
-                tokens.push(Token::Semicolon);
-                index += 1;
+                self.tokens.push(Token::Semicolon);
+                self.index += 1;
             }
-            character if character.is_ascii_digit() => {
-                tokens.push(lex_number(&characters, &mut index)?);
+            c if c.is_ascii_digit() => {
+                self.tokens
+                    .push(lex_number(self.characters, &mut self.index)?);
             }
-            character if is_identifier_start(character) => {
-                let identifier = lex_identifier(&characters, &mut index);
-                tokens.push(match identifier.as_str() {
+            c if is_identifier_start(c) => {
+                let identifier = lex_identifier(self.characters, &mut self.index);
+                self.tokens.push(match identifier.as_str() {
                     "let" => Token::Let,
                     "var" => Token::Var,
                     "const" => Token::Const,
@@ -391,9 +644,8 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
             }
             other => return Err(ParseError::Unexpected(other)),
         }
+        Ok(())
     }
-    tokens.push(Token::Eof);
-    Ok(tokens)
 }
 
 fn is_identifier_start(character: char) -> bool {
@@ -680,6 +932,8 @@ impl Parser {
         match self.next() {
             Token::Int(value) => Ok(Expr::Int(value)),
             Token::Float(value) => Ok(Expr::Float(value)),
+            Token::String(text) => Ok(Expr::String(text)),
+            Token::TemplateStart => self.template(),
             Token::True => Ok(Expr::Bool(true)),
             Token::False => Ok(Expr::Bool(false)),
             Token::Null => Ok(Expr::Null),
@@ -699,9 +953,32 @@ impl Parser {
         }
     }
 
+    /// Parses `` `text ${expr} text` `` into text/substitution parts, after
+    /// the opening `TemplateStart` and through the closing `TemplateEnd`.
+    fn template(&mut self) -> Result<Expr, ParseError> {
+        let mut parts = Vec::new();
+        loop {
+            match self.next() {
+                Token::TemplateText(text) => parts.push(TemplatePart::Text(text)),
+                Token::TemplateExprOpen => {
+                    let expression = self.expression()?;
+                    match self.next() {
+                        Token::TemplateExprClose => {
+                            parts.push(TemplatePart::Substitution(expression))
+                        }
+                        Token::Eof => return Err(ParseError::UnexpectedEnd),
+                        _ => return Err(ParseError::TrailingInput),
+                    }
+                }
+                Token::TemplateEnd => break,
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                _ => return Err(ParseError::TrailingInput),
+            }
+        }
+        Ok(Expr::Template(parts))
+    }
+
     /// Recognizes `console.log(expression)` — the Phase 1 print intrinsic.
-    /// Reachable only when `console` is not consumed as a variable name, so
-    /// it is probed by structure rather than matched in `primary`.
     fn console_log(&mut self) -> Result<Expr, ParseError> {
         if self.next() != Token::Dot {
             return Err(ParseError::Unsupported("only console.log calls"));
@@ -897,17 +1174,17 @@ impl Parser {
     }
 }
 
-pub fn compile(expression: &Expr) -> Result<Vec<Instruction>, CompileError> {
+pub fn compile(expression: &Expr) -> Result<Compiled, CompileError> {
     let mut compiler = Compiler::new();
     compiler.expression(expression)?;
     compiler.emit(Instruction::return_());
-    Ok(compiler.instructions)
+    Ok(compiler.finish())
 }
 
 /// Compiles a program. Statements produce no value; the final statement's
 /// value is kept only when it is an expression statement (REPL semantics),
 /// otherwise the program evaluates to `undefined`.
-pub fn compile_program(program: &[Stmt]) -> Result<Vec<Instruction>, CompileError> {
+pub fn compile_program(program: &[Stmt]) -> Result<Compiled, CompileError> {
     let mut compiler = Compiler::new();
     let last_keeps_value = matches!(program.last(), Some(Stmt::Expression(_)));
     for (index, statement) in program.iter().enumerate() {
@@ -918,7 +1195,7 @@ pub fn compile_program(program: &[Stmt]) -> Result<Vec<Instruction>, CompileErro
         compiler.emit(Instruction::load_undefined());
     }
     compiler.emit(Instruction::return_());
-    Ok(compiler.instructions)
+    Ok(compiler.finish())
 }
 
 struct Local {
@@ -928,6 +1205,9 @@ struct Local {
 
 struct Compiler {
     instructions: Vec<Instruction>,
+    /// String-constant pool; `OP_LOAD_STRING` operands index into it.
+    pool: Vec<Value>,
+    string_indices: HashMap<String, usize>,
     scopes: Vec<HashMap<String, Local>>,
     locals: usize,
 }
@@ -936,8 +1216,17 @@ impl Compiler {
     fn new() -> Self {
         Self {
             instructions: Vec::new(),
+            pool: Vec::new(),
+            string_indices: HashMap::new(),
             scopes: vec![HashMap::new()],
             locals: 0,
+        }
+    }
+
+    fn finish(self) -> Compiled {
+        Compiled {
+            instructions: self.instructions,
+            pool: self.pool,
         }
     }
 
@@ -948,6 +1237,16 @@ impl Compiler {
 
     fn patch(&mut self, index: usize, target: usize) {
         self.instructions[index].operand = target as i32;
+    }
+
+    fn string_index(&mut self, text: &str) -> usize {
+        if let Some(&index) = self.string_indices.get(text) {
+            return index;
+        }
+        let index = self.pool.len();
+        self.pool.push(Value::string_literal(text));
+        self.string_indices.insert(text.to_string(), index);
+        index
     }
 
     fn declare(&mut self, name: &str, is_const: bool) -> Result<usize, CompileError> {
@@ -1000,6 +1299,41 @@ impl Compiler {
                     .ok_or_else(|| CompileError::Undeclared(name.clone()))?
                     .slot;
                 self.emit(Instruction::get_local(slot));
+            }
+            Expr::String(text) => {
+                let index = self.string_index(text);
+                self.emit(Instruction::load_string(index));
+            }
+            Expr::Template(parts) => {
+                // Every substitution is explicitly stringified so `${a}${b}`
+                // never performs a numeric add, and a trailing text part
+                // (possibly empty) keeps the result a string, as in JS.
+                for (index, part) in parts.iter().enumerate() {
+                    match part {
+                        TemplatePart::Text(text) => {
+                            let pool_index = self.string_index(text);
+                            self.emit(Instruction::load_string(pool_index));
+                        }
+                        TemplatePart::Substitution(substitution) => {
+                            self.expression(substitution)?;
+                            self.emit(Instruction::unary(r8_abi::OP_TO_STRING));
+                        }
+                    }
+                    if index > 0 {
+                        self.emit(Instruction::binary(r8_abi::OP_ADD));
+                    }
+                }
+                if parts.is_empty() {
+                    // `` evaluates to the empty string.
+                    let pool_index = self.string_index("");
+                    self.emit(Instruction::load_string(pool_index));
+                } else if !matches!(parts.last(), Some(TemplatePart::Text(_))) {
+                    // Load the trailing empty string, then concatenate: the
+                    // ADD comes after its second operand is on the stack.
+                    let pool_index = self.string_index("");
+                    self.emit(Instruction::load_string(pool_index));
+                    self.emit(Instruction::binary(r8_abi::OP_ADD));
+                }
             }
             Expr::Assign(op, name, value) => {
                 let (slot, is_const) = match self.lookup(name) {
@@ -1207,9 +1541,9 @@ mod tests {
 
     #[test]
     fn compiles_to_stack_bytecode() {
-        let instructions = compile(&parse("1+1").unwrap()).unwrap();
+        let compiled = compile(&parse("1+1").unwrap()).unwrap();
         assert_eq!(
-            instructions,
+            compiled.instructions,
             vec![
                 Instruction::load_int(1),
                 Instruction::load_int(1),
@@ -1217,6 +1551,7 @@ mod tests {
                 Instruction::return_()
             ]
         );
+        assert!(compiled.pool.is_empty());
     }
 
     #[test]
@@ -1306,6 +1641,119 @@ mod tests {
                 Token::RightBrace,
                 Token::Eof
             ]
+        );
+    }
+
+    #[test]
+    fn lexes_string_literals() {
+        assert_eq!(
+            tokenize("'hi' \"there\"").unwrap(),
+            vec![
+                Token::String("hi".into()),
+                Token::String("there".into()),
+                Token::Eof
+            ]
+        );
+        // Escapes cook into their characters.
+        assert_eq!(
+            tokenize(r#"'a\nb\t\\\'\"\0'"#).unwrap(),
+            vec![Token::String("a\nb\t\\'\"\0".into()), Token::Eof]
+        );
+        assert_eq!(
+            tokenize(r#""\x41\u{48}""#).unwrap(),
+            vec![Token::String("AH".into()), Token::Eof]
+        );
+        // Identity escapes pass the character through.
+        assert_eq!(
+            tokenize(r#"'A'"#).unwrap(),
+            vec![Token::String("A".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_strings() {
+        assert_eq!(parse("'oops"), Err(ParseError::UnterminatedString));
+        assert_eq!(parse("'line\nbreak'"), Err(ParseError::UnterminatedString));
+        assert_eq!(parse(r"'\u{zz}'"), Err(ParseError::InvalidEscape));
+        assert_eq!(parse(r"'\u12'"), Err(ParseError::InvalidEscape));
+    }
+
+    #[test]
+    fn lexes_template_literals() {
+        assert_eq!(
+            tokenize("`hello ${name}!`").unwrap(),
+            vec![
+                Token::TemplateStart,
+                Token::TemplateText("hello ".into()),
+                Token::TemplateExprOpen,
+                Token::Identifier("name".into()),
+                Token::TemplateExprClose,
+                Token::TemplateText("!".into()),
+                Token::TemplateEnd,
+                Token::Eof
+            ]
+        );
+        // Nested templates inside substitutions lex structurally: the inner
+        // backtick opens a nested TemplateStart/TemplateEnd pair, and braces
+        // inside a substitution are tracked so `}` closes the substitution
+        // only at depth zero. (Object literals with `:` come in Phase 5.)
+        let tokens = tokenize("`a${ {} }c`").unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|t| matches!(t, Token::TemplateStart))
+                .count(),
+            1
+        );
+        assert!(tokens.contains(&Token::LeftBrace));
+        assert!(tokens.contains(&Token::RightBrace));
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|t| matches!(t, Token::TemplateExprClose))
+                .count(),
+            1
+        );
+        // A nested template produces two TemplateStart/End pairs.
+        let tokens = tokenize("`${ `x${1}` }`").unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|t| matches!(t, Token::TemplateStart))
+                .count(),
+            2
+        );
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|t| matches!(t, Token::TemplateEnd))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn parses_templates() {
+        assert_eq!(
+            parse("`hello ${name}!`").unwrap(),
+            Expr::Template(vec![
+                TemplatePart::Text("hello ".into()),
+                TemplatePart::Substitution(Expr::Var("name".into())),
+                TemplatePart::Text("!".into()),
+            ])
+        );
+        // Substitutions hold full expressions.
+        assert_eq!(
+            parse("`x${1 + 1}y`").unwrap(),
+            Expr::Template(vec![
+                TemplatePart::Text("x".into()),
+                TemplatePart::Substitution(Expr::Binary(
+                    BinaryOp::Add,
+                    Box::new(Expr::Int(1)),
+                    Box::new(Expr::Int(1))
+                )),
+                TemplatePart::Text("y".into()),
+            ])
         );
     }
 
@@ -1628,25 +2076,100 @@ mod tests {
 
     #[test]
     fn compiles_float_literal_to_two_instructions() {
-        let instructions = compile(&parse("1.5").unwrap()).unwrap();
-        assert_eq!(instructions.len(), 3);
-        assert_eq!(instructions[0].op, r8_abi::OP_LOAD_F64_HI);
-        assert_eq!(instructions[1].op, r8_abi::OP_LOAD_F64);
-        assert_eq!(instructions[2].op, OP_RETURN);
+        let compiled = compile(&parse("1.5").unwrap()).unwrap();
+        assert_eq!(compiled.instructions.len(), 3);
+        assert_eq!(compiled.instructions[0].op, r8_abi::OP_LOAD_F64_HI);
+        assert_eq!(compiled.instructions[1].op, r8_abi::OP_LOAD_F64);
+        assert_eq!(compiled.instructions[2].op, OP_RETURN);
     }
 
     #[test]
     fn compiles_large_integers_through_the_float_path() {
-        let instructions = compile(&parse("5000000000").unwrap()).unwrap();
-        assert_eq!(instructions[0].op, r8_abi::OP_LOAD_F64_HI);
+        let compiled = compile(&parse("5000000000").unwrap()).unwrap();
+        assert_eq!(compiled.instructions[0].op, r8_abi::OP_LOAD_F64_HI);
+    }
+
+    #[test]
+    fn compiles_string_literals_into_the_pool() {
+        let compiled = compile(&parse("'hello'").unwrap()).unwrap();
+        assert_eq!(compiled.instructions.len(), 2);
+        assert_eq!(compiled.instructions[0].op, r8_abi::OP_LOAD_STRING);
+        assert_eq!(compiled.instructions[0].operand, 0);
+        assert_eq!(compiled.pool.len(), 1);
+        assert_eq!(compiled.pool[0].as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn interns_duplicate_string_literals() {
+        let compiled = compile(&parse("'a' + 'b' + 'a'").unwrap()).unwrap();
+        assert_eq!(compiled.pool.len(), 2);
+        let operands: Vec<i32> = compiled
+            .instructions
+            .iter()
+            .filter(|i| i.op == r8_abi::OP_LOAD_STRING)
+            .map(|i| i.operand)
+            .collect();
+        assert_eq!(operands, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn compiles_templates_with_to_string() {
+        // `x${1}y` -> load "x"; load 1; toString; add; load "y"; add
+        let compiled = compile(&parse("`x${1}y`").unwrap()).unwrap();
+        let ops: Vec<u32> = compiled.instructions.iter().map(|i| i.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                r8_abi::OP_LOAD_STRING, // "x"
+                r8_abi::OP_LOAD_INT,    // 1
+                r8_abi::OP_TO_STRING,   // stringify
+                r8_abi::OP_ADD,         // "x" + "1"
+                r8_abi::OP_LOAD_STRING, // "y"
+                r8_abi::OP_ADD,         // ... + "y"
+                OP_RETURN
+            ]
+        );
+        // Pool holds just the two text chunks ("x" and "y"); the trailing
+        // empty string only appears when the template ends on a
+        // substitution.
+        assert_eq!(compiled.pool.len(), 2);
+        assert_eq!(compiled.pool[1].as_str(), Some("y"));
+    }
+
+    #[test]
+    fn compiles_substitution_final_templates_with_trailing_empty() {
+        // `${1}` -> toString(1) + ""
+        let compiled = compile(&parse("`${1}`").unwrap()).unwrap();
+        let ops: Vec<u32> = compiled.instructions.iter().map(|i| i.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                r8_abi::OP_LOAD_INT,    // 1
+                r8_abi::OP_TO_STRING,   // stringify
+                r8_abi::OP_LOAD_STRING, // ""
+                r8_abi::OP_ADD,         // "1" + ""
+                OP_RETURN
+            ]
+        );
+        assert_eq!(compiled.pool.len(), 1);
+        assert_eq!(compiled.pool[0].as_str(), Some(""));
+    }
+
+    #[test]
+    fn compiles_empty_template() {
+        let compiled = compile(&parse("``").unwrap()).unwrap();
+        assert_eq!(compiled.instructions.len(), 2);
+        assert_eq!(compiled.instructions[0].op, r8_abi::OP_LOAD_STRING);
+        assert_eq!(compiled.pool.len(), 1);
+        assert_eq!(compiled.pool[0].as_str(), Some(""));
     }
 
     #[test]
     fn compiles_variables_to_local_slots() {
         let program = parse_program("let x = 1; let y = x + 1; y").unwrap();
-        let instructions = compile_program(&program).unwrap();
+        let compiled = compile_program(&program).unwrap();
         assert_eq!(
-            instructions,
+            compiled.instructions,
             vec![
                 Instruction::load_int(1),
                 Instruction::set_local(0),
@@ -1663,8 +2186,9 @@ mod tests {
     #[test]
     fn compiles_shadowing_to_distinct_slots() {
         let program = parse_program("let x = 1; { let x = 2; x; } x").unwrap();
-        let instructions = compile_program(&program).unwrap();
-        let get_slots: Vec<i32> = instructions
+        let compiled = compile_program(&program).unwrap();
+        let get_slots: Vec<i32> = compiled
+            .instructions
             .iter()
             .filter(|i| i.op == r8_abi::OP_GET_LOCAL)
             .map(|i| i.operand)
@@ -1676,9 +2200,9 @@ mod tests {
     #[test]
     fn compiles_assignment_with_value() {
         let program = parse_program("let x = 0; let y = (x = 5) + 1; y").unwrap();
-        let instructions = compile_program(&program).unwrap();
+        let compiled = compile_program(&program).unwrap();
         assert_eq!(
-            instructions,
+            compiled.instructions,
             vec![
                 Instruction::load_int(0),
                 Instruction::set_local(0),
@@ -1718,7 +2242,8 @@ mod tests {
     fn compiles_if_else_jumps() {
         let program =
             parse_program("let x = 0; if (1 < 2) { x = 10; } else { x = 20; } x").unwrap();
-        let instructions = compile_program(&program).unwrap();
+        let compiled = compile_program(&program).unwrap();
+        let instructions = &compiled.instructions;
         // Locate the conditional jump and verify its patched targets.
         let branch = instructions
             .iter()
@@ -1742,15 +2267,19 @@ mod tests {
     #[test]
     fn compiles_while_loop() {
         let program = parse_program("let i = 0; while (i < 3) { i += 1; } i").unwrap();
-        let instructions = compile_program(&program).unwrap();
-        let back_jump = instructions
+        let compiled = compile_program(&program).unwrap();
+        let back_jump = compiled
+            .instructions
             .iter()
             .rev()
             .find(|i| i.op == r8_abi::OP_JMP)
             .unwrap();
         // The loop's back-jump lands on the condition load.
         let condition_index = back_jump.operand as usize;
-        assert_eq!(instructions[condition_index].op, r8_abi::OP_GET_LOCAL);
+        assert_eq!(
+            compiled.instructions[condition_index].op,
+            r8_abi::OP_GET_LOCAL
+        );
     }
 
     #[test]
@@ -1758,39 +2287,54 @@ mod tests {
         let program =
             parse_program("let total = 0; for (let i = 0; i < 3; i += 1) { total += i; } total")
                 .unwrap();
-        let instructions = compile_program(&program).unwrap();
+        let compiled = compile_program(&program).unwrap();
         // for-init declares i in slot 1.
         assert!(
-            instructions
+            compiled
+                .instructions
                 .iter()
                 .any(|i| i.op == r8_abi::OP_SET_LOCAL && i.operand == 1)
         );
         // The loop contains a back-jump to a condition and an update POP.
-        assert!(instructions.iter().rev().any(|i| i.op == r8_abi::OP_JMP));
-        assert!(instructions.iter().any(|i| i.op == r8_abi::OP_JMP_IF_FALSE));
+        assert!(
+            compiled
+                .instructions
+                .iter()
+                .rev()
+                .any(|i| i.op == r8_abi::OP_JMP)
+        );
+        assert!(
+            compiled
+                .instructions
+                .iter()
+                .any(|i| i.op == r8_abi::OP_JMP_IF_FALSE)
+        );
     }
 
     #[test]
     fn compiles_logical_operators_with_dup_and_jumps() {
         let program = parse_program("let x = 0; x = (0 && 5) || 7; x").unwrap();
-        let instructions = compile_program(&program).unwrap();
+        let compiled = compile_program(&program).unwrap();
         // One DUP per logical operator plus the assignment's value DUP.
         assert_eq!(
-            instructions
+            compiled
+                .instructions
                 .iter()
                 .filter(|i| i.op == r8_abi::OP_DUP)
                 .count(),
             3
         );
         assert_eq!(
-            instructions
+            compiled
+                .instructions
                 .iter()
                 .filter(|i| i.op == r8_abi::OP_JMP_IF_FALSE)
                 .count(),
             1
         );
         assert_eq!(
-            instructions
+            compiled
+                .instructions
                 .iter()
                 .filter(|i| i.op == r8_abi::OP_JMP_IF_TRUE)
                 .count(),
@@ -1803,9 +2347,9 @@ mod tests {
         // Non-final statements pop; a non-expression final statement yields
         // undefined.
         let program = parse_program("let a = 1;").unwrap();
-        let instructions = compile_program(&program).unwrap();
+        let compiled = compile_program(&program).unwrap();
         assert_eq!(
-            instructions,
+            compiled.instructions,
             vec![
                 Instruction::load_int(1),
                 Instruction::set_local(0),
@@ -1814,9 +2358,9 @@ mod tests {
             ]
         );
         let program = parse_program("1; 2").unwrap();
-        let instructions = compile_program(&program).unwrap();
+        let compiled = compile_program(&program).unwrap();
         assert_eq!(
-            instructions,
+            compiled.instructions,
             vec![
                 Instruction::load_int(1),
                 Instruction::pop(),
@@ -1825,16 +2369,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            compile_program(&[]).unwrap(),
+            compile_program(&[]).unwrap().instructions,
             vec![Instruction::load_undefined(), Instruction::return_()]
         );
     }
 
     #[test]
     fn compiles_console_log_to_print() {
-        let instructions = compile(&parse("console.log(2+3)").unwrap()).unwrap();
+        let compiled = compile(&parse("console.log(2+3)").unwrap()).unwrap();
         assert_eq!(
-            instructions,
+            compiled.instructions,
             vec![
                 Instruction::load_int(2),
                 Instruction::load_int(3),
@@ -1843,6 +2387,6 @@ mod tests {
                 Instruction::return_()
             ]
         );
-        assert_eq!(instructions[3].op, r8_abi::OP_PRINT);
+        assert_eq!(compiled.instructions[3].op, r8_abi::OP_PRINT);
     }
 }

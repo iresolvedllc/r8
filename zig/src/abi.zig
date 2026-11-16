@@ -1,9 +1,10 @@
 //! ABI version note: this file hand-mirrors `crates/r8-abi`. ABI v2 added
-//! doubles/booleans/print; ABI v3 adds locals, DUP, and jumps.
+//! doubles/booleans/print; ABI v3 added locals, DUP, and jumps; ABI v4 adds
+//! strings (TAG_STRING, constant pool, LOAD_STRING/TO_STRING).
 
 const std = @import("std");
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// Value tags. Mirrors `crates/r8-abi`'s constants; the `CONFORMANCE_TAGS`
 /// table below lists them in the same canonical order — keep both in sync.
@@ -13,6 +14,7 @@ pub const TAG_FLOAT: u32 = 3;
 pub const TAG_BOOL: u32 = 4;
 pub const TAG_NULL: u32 = 5;
 pub const TAG_UNDEFINED: u32 = 6;
+pub const TAG_STRING: u32 = 7;
 
 /// Opcodes. Mirrors `crates/r8-abi`; the `CONFORMANCE_OPS` table below lists
 /// them in the same canonical order — keep both in sync.
@@ -62,9 +64,16 @@ pub const OP_JMP: u32 = 28;
 pub const OP_JMP_IF_FALSE: u32 = 29;
 /// Pops the condition; jumps to `operand` when it is truthy.
 pub const OP_JMP_IF_TRUE: u32 = 30;
+/// Pushes a copy of string constant `operand` from the pool. The machine
+/// copies the bytes into its own arena, so the pool only needs to outlive
+/// the call.
+pub const OP_LOAD_STRING: u32 = 31;
+/// Pops a value and pushes its JS `String()` rendering as a string value
+/// (used by template-literal substitutions).
+pub const OP_TO_STRING: u32 = 32;
 
 /// Canonical tag order mirrored from `crates/r8-abi`'s `CONFORMANCE_TAGS`.
-const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED };
+const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED, TAG_STRING };
 
 /// Canonical opcode order mirrored from `crates/r8-abi`'s `CONFORMANCE_OPS`.
 /// New opcodes are appended at the end so existing indices stay stable.
@@ -100,6 +109,8 @@ const CONFORMANCE_OPS = [_]u32{
     OP_JMP,
     OP_JMP_IF_FALSE,
     OP_JMP_IF_TRUE,
+    OP_LOAD_STRING,
+    OP_TO_STRING,
 };
 
 pub const Value = extern struct {
@@ -137,18 +148,38 @@ pub const Value = extern struct {
         return self.payload != 0;
     }
 
+    /// Resolves a string value's bytes. The slice points into memory owned
+    /// by the value's creator (the Rust pool or the machine's arena) and is
+    /// valid as documented in `crates/r8-abi`.
+    pub fn asString(self: Value) ?[]const u8 {
+        if (self.tag != TAG_STRING) return null;
+        const keel_string: *const KeelString = @ptrFromInt(@as(usize, @bitCast(self.payload)));
+        return keel_string.ptr[0..keel_string.len];
+    }
+
     pub fn isNumber(self: Value) bool {
         return self.tag == TAG_INT or self.tag == TAG_FLOAT;
     }
 
-    /// JS `ToNumber` over the value types that exist so far. Strings and
-    /// objects arrive in later phases.
+    /// JS `ToNumber` over the value types that exist so far. String
+    /// conversion follows `Number()` for the common cases (trimmed text,
+    /// empty string is 0, Infinity spellings); exotic forms are Phase 3
+    /// approximations.
     pub fn toNumber(self: Value) f64 {
         return switch (self.tag) {
             TAG_INT => @floatFromInt(self.payload),
             TAG_FLOAT => @bitCast(@as(u64, @bitCast(self.payload))),
             TAG_BOOL => if (self.payload != 0) 1.0 else 0.0,
             TAG_NULL => 0.0,
+            TAG_STRING => blk: {
+                const bytes = self.asString() orelse break :blk std.math.nan(f64);
+                const trimmed = std.mem.trim(u8, bytes, " \t\n\r\x0b\x0c");
+                if (trimmed.len == 0) break :blk 0.0;
+                if (std.mem.eql(u8, trimmed, "Infinity")) break :blk std.math.inf(f64);
+                if (std.mem.eql(u8, trimmed, "+Infinity")) break :blk std.math.inf(f64);
+                if (std.mem.eql(u8, trimmed, "-Infinity")) break :blk -std.math.inf(f64);
+                break :blk std.fmt.parseFloat(f64, trimmed) catch std.math.nan(f64);
+            },
             else => std.math.nan(f64), // undefined, objects, unknown tags
         };
     }
@@ -169,12 +200,19 @@ pub const Instruction = extern struct {
     }
 };
 
+/// A borrowed string in memory owned by the value's creator; mirrors
+/// `crates/r8-abi`'s `KeelString`.
+pub const KeelString = extern struct {
+    ptr: [*]const u8,
+    len: usize,
+};
+
 comptime {
     if (@sizeOf(Value) != 16) @compileError("Value must be 16 bytes");
     if (@alignOf(Value) != 8) @compileError("Value must align to 8");
     if (@sizeOf(Instruction) != 8) @compileError("Instruction must be 8 bytes");
-    if (CONFORMANCE_TAGS.len != 6) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
-    if (CONFORMANCE_OPS.len != 31) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
+    if (CONFORMANCE_TAGS.len != 7) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
+    if (CONFORMANCE_OPS.len != 33) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
 }
 
 pub export fn r8_abi_version() u32 {
