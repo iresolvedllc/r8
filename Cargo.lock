@@ -143,6 +143,7 @@ name = "r8-api"
 version = "0.1.0"
 dependencies = [
  "r8-abi",
+ "r8-front",
  "r8-runtime",
 ]
 

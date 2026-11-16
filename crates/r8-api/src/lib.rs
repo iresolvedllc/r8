@@ -2,6 +2,7 @@
 //! identity.
 
 pub use r8_abi::{ABI_VERSION, Value};
+pub use r8_front::CompileError;
 pub use r8_runtime::{EvalError, eval, eval_i64, eval_program};
 
 pub struct Engine;

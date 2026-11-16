@@ -59,6 +59,22 @@ fn main() {
             ] {
                 check_eval(&mut failures, source, expected);
             }
+            for (source, expected) in [
+                (
+                    "let i = 0; let total = 0; while (i < 5) { total += i; i += 1; } total",
+                    "10",
+                ),
+                (
+                    "let total = 0; for (let i = 0; i < 10; i += 1) { total += i; } total",
+                    "45",
+                ),
+                ("let x = 0; if (2 > 1) { x = 10; } else { x = 20; } x", "10"),
+                ("let x = 1; { let x = 2; } x", "1"),
+                ("0 && 5", "0"),
+                ("0 || 7", "7"),
+            ] {
+                check_program(&mut failures, source, expected);
+            }
             check_layout(&mut failures);
             check_conformance(&mut failures);
             if failures.is_empty() {
@@ -82,6 +98,18 @@ fn main() {
 
 fn check_eval(failures: &mut Vec<String>, source: &str, expected: &str) {
     match r8_api::eval(source) {
+        Ok(value) => {
+            let actual = value.to_string();
+            if actual != expected {
+                failures.push(format!("{source} => {actual}, expected {expected}"));
+            }
+        }
+        Err(error) => failures.push(format!("{source} => {error}")),
+    }
+}
+
+fn check_program(failures: &mut Vec<String>, source: &str, expected: &str) {
+    match r8_api::eval_program(source) {
         Ok(value) => {
             let actual = value.to_string();
             if actual != expected {
