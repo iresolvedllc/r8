@@ -1,17 +1,21 @@
 //! R8 front end: lexer, parser, AST, and bytecode compiler.
 //!
-//! Phase 3 adds strings: string literals with escapes, template literals
-//! with nested substitutions, a constant pool for string literals (interned
-//! by value), and `OP_TO_STRING` for substitutions. The compiler output is a
-//! `Compiled` (bytecode + pool) because the machine now takes both.
+//! Phase 4 adds functions: declarations, anonymous function expressions,
+//! arrow functions (with paren-free single parameters), `return`, calls, and
+//! JS-correct closures. Each function compiles into its own instruction
+//! buffer; buffers concatenate into the flat stream in completion order and
+//! the machine finds them through a `KeelFunction` table. Captured bindings
+//! are detected by a syntactic prescan (shadowing-aware) and compiled into
+//! heap cells so closures share mutation; upvalue chains are built
+//! transitively at reference resolution.
 //!
 //! Phase 2 compiled statements: `let`/`const`/`var` declarations, assignment,
 //! blocks, `if`/`else`, `while`, `for`, and short-circuit `&&`/`||`, with a
 //! scope-aware compiler that gives every declaration its own local slot and
 //! patches absolute-index jumps.
 
-use r8_abi::{Instruction, Value};
-use std::collections::HashMap;
+use r8_abi::{Instruction, KeelFunction, Value};
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 /// Local slot count, mirrored from the machine's `LOCAL_COUNT` in
@@ -79,6 +83,14 @@ pub enum UnaryOp {
     Not,
 }
 
+/// An arrow body: either a bare expression (its value is the return value)
+/// or a braced block of statements.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArrowBody {
+    Expression(Box<Expr>),
+    Block(Vec<Stmt>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TemplatePart {
     Text(String),
@@ -95,6 +107,19 @@ pub enum Expr {
     Var(String),
     String(String),
     Template(Vec<TemplatePart>),
+    /// Anonymous `function (params) { body }` expression.
+    FunctionExpr {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
+    /// `(params) => body` or `x => body` (no `this`/`arguments` binding in
+    /// this phase, so arrow bodies compile like plain functions).
+    Arrow {
+        params: Vec<String>,
+        body: ArrowBody,
+    },
+    /// `callee(arg, ...)` — the callee is any expression.
+    Call(Box<Expr>, Vec<Expr>),
     Assign(AssignOp, String, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
@@ -133,6 +158,12 @@ pub enum Stmt {
         update: Option<Expr>,
         body: Box<Stmt>,
     },
+    Function {
+        name: String,
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
+    Return(Option<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -175,6 +206,7 @@ pub enum Token {
     Dot,
     Comma,
     Semicolon,
+    EqArrow,
     Identifier(String),
     Let,
     Var,
@@ -183,6 +215,8 @@ pub enum Token {
     Else,
     While,
     For,
+    Function,
+    Return,
     True,
     False,
     Null,
@@ -226,11 +260,13 @@ pub enum CompileError {
     TooManyLocals,
 }
 
-/// Bytecode plus its string-constant pool; both are passed to the machine.
+/// Bytecode plus its string-constant pool and function table; all three are
+/// passed to the machine.
 #[derive(Debug, Clone)]
 pub struct Compiled {
     pub instructions: Vec<Instruction>,
     pub pool: Vec<Value>,
+    pub functions: Vec<KeelFunction>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -579,6 +615,9 @@ impl Lexer<'_> {
                 } else if self.characters.get(self.index + 1) == Some(&'=') {
                     self.tokens.push(Token::EqEq);
                     self.index += 2;
+                } else if self.characters.get(self.index + 1) == Some(&'>') {
+                    self.tokens.push(Token::EqArrow);
+                    self.index += 2;
                 } else {
                     self.tokens.push(Token::EqAssign);
                     self.index += 1;
@@ -635,6 +674,8 @@ impl Lexer<'_> {
                     "else" => Token::Else,
                     "while" => Token::While,
                     "for" => Token::For,
+                    "function" => Token::Function,
+                    "return" => Token::Return,
                     "true" => Token::True,
                     "false" => Token::False,
                     "null" => Token::Null,
@@ -921,11 +962,36 @@ impl Parser {
             Token::Minus => UnaryOp::Neg,
             Token::Plus => UnaryOp::Plus,
             Token::Bang => UnaryOp::Not,
-            _ => return self.primary(),
+            _ => return self.postfix(),
         };
         self.index += 1;
         let operand = self.unary()?;
         Ok(Expr::Unary(op, Box::new(operand)))
+    }
+
+    /// Postfix operators: call arguments `f(a, b)`. Property access arrives
+    /// in Phase 5.
+    fn postfix(&mut self) -> Result<Expr, ParseError> {
+        let mut expression = self.primary()?;
+        while self.peek() == &Token::LParen {
+            self.index += 1;
+            let mut arguments = Vec::new();
+            if self.peek() == &Token::RParen {
+                self.index += 1;
+            } else {
+                loop {
+                    arguments.push(self.assignment()?);
+                    match self.next() {
+                        Token::Comma => {}
+                        Token::RParen => break,
+                        Token::Eof => return Err(ParseError::UnexpectedEnd),
+                        _ => return Err(ParseError::TrailingInput),
+                    }
+                }
+            }
+            expression = Expr::Call(Box::new(expression), arguments);
+        }
+        Ok(expression)
     }
 
     fn primary(&mut self) -> Result<Expr, ParseError> {
@@ -939,8 +1005,26 @@ impl Parser {
             Token::Null => Ok(Expr::Null),
             Token::Undefined => Ok(Expr::Undefined),
             Token::Identifier(name) if name == "console" => self.console_log(),
-            Token::Identifier(name) => Ok(Expr::Var(name)),
+            Token::Identifier(name) => {
+                // Single-parameter arrow without parens: `x => body`.
+                if self.tokens.get(self.index) == Some(&Token::EqArrow) {
+                    self.next(); // `=>`
+                    let params = vec![name];
+                    let body = self.arrow_body()?;
+                    return Ok(Expr::Arrow { params, body });
+                }
+                Ok(Expr::Var(name))
+            }
             Token::LParen => {
+                // Arrow disambiguation: `(a, b) => ...` vs a parenthesized
+                // expression. Lookahead scans for a simple identifier list
+                // followed by `=>`. The `(` is already consumed here.
+                if self.looks_like_arrow_params(self.index) {
+                    let params = self.param_names()?;
+                    self.next(); // `=>`
+                    let body = self.arrow_body()?;
+                    return Ok(Expr::Arrow { params, body });
+                }
                 let expression = self.expression()?;
                 match self.next() {
                     Token::RParen => Ok(expression),
@@ -948,9 +1032,53 @@ impl Parser {
                     _ => Err(ParseError::TrailingInput),
                 }
             }
+            Token::Function => self.function_expression(),
             Token::Eof => Err(ParseError::UnexpectedEnd),
             _ => Err(ParseError::ExpectedExpression),
         }
+    }
+
+    /// From a token index right after `(`, decides whether the tokens form a
+    /// plain parameter list followed by `=>` (without consuming anything).
+    fn looks_like_arrow_params(&self, mut index: usize) -> bool {
+        // Empty params: `() =>`.
+        if matches!(self.tokens.get(index), Some(Token::RParen)) {
+            return matches!(self.tokens.get(index + 1), Some(Token::EqArrow));
+        }
+        loop {
+            if !matches!(self.tokens.get(index), Some(Token::Identifier(_))) {
+                return false;
+            }
+            index += 1;
+            match self.tokens.get(index) {
+                Some(Token::Comma) => index += 1,
+                Some(Token::RParen) => {
+                    return matches!(self.tokens.get(index + 1), Some(Token::EqArrow));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Parses the body after `=>`: a braced block or a bare expression.
+    fn arrow_body(&mut self) -> Result<ArrowBody, ParseError> {
+        if self.peek() == &Token::LeftBrace {
+            Ok(ArrowBody::Block(self.function_body()?))
+        } else {
+            Ok(ArrowBody::Expression(Box::new(self.expression()?)))
+        }
+    }
+
+    /// Parses `function (params) { body }` — anonymous function expressions
+    /// only (named function expressions need self-binding machinery). The
+    /// `function` keyword was already consumed by `primary`.
+    fn function_expression(&mut self) -> Result<Expr, ParseError> {
+        if let Token::Identifier(_) = self.peek() {
+            return Err(ParseError::Unsupported("named function expressions"));
+        }
+        let params = self.param_list()?;
+        let body = self.function_body()?;
+        Ok(Expr::FunctionExpr { params, body })
     }
 
     /// Parses `` `text ${expr} text` `` into text/substitution parts, after
@@ -1020,6 +1148,8 @@ impl Parser {
             Token::If => self.if_statement(),
             Token::While => self.while_statement(),
             Token::For => self.for_statement(),
+            Token::Function => self.function_declaration(),
+            Token::Return => self.return_statement(),
             Token::LeftBrace => {
                 self.next();
                 Ok(Stmt::Block(self.block_body()?))
@@ -1071,6 +1201,81 @@ impl Parser {
             None
         };
         Ok(Declarator { name, init })
+    }
+
+    fn function_declaration(&mut self) -> Result<Stmt, ParseError> {
+        self.next(); // `function`
+        let name = match self.next() {
+            Token::Identifier(name) => name,
+            Token::Eof => return Err(ParseError::UnexpectedEnd),
+            _ => return Err(ParseError::ExpectedIdentifier),
+        };
+        let params = self.param_list()?;
+        let body = self.function_body()?;
+        Ok(Stmt::Function { name, params, body })
+    }
+
+    fn return_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.next(); // `return`
+        // A return value is optional: `return;` ends the statement.
+        let value = match self.peek() {
+            Token::Semicolon | Token::RightBrace | Token::Eof => None,
+            _ => Some(self.expression()?),
+        };
+        self.end_statement()?;
+        Ok(Stmt::Return(value))
+    }
+
+    /// Parses `(a, b, c)` — identifiers separated by commas. Default values,
+    /// rest parameters, and destructuring are later-phase work.
+    fn param_list(&mut self) -> Result<Vec<String>, ParseError> {
+        self.expect(&Token::LParen)?;
+        self.param_names()
+    }
+
+    /// Parses the identifier list inside a parameter list; `(` must already
+    /// be consumed.
+    fn param_names(&mut self) -> Result<Vec<String>, ParseError> {
+        let mut params = Vec::new();
+        if self.peek() == &Token::RParen {
+            self.index += 1;
+            return Ok(params);
+        }
+        loop {
+            match self.next() {
+                Token::Identifier(name) => params.push(name),
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                _ => return Err(ParseError::Unsupported("only simple parameter names")),
+            }
+            match self.next() {
+                Token::Comma => {}
+                Token::RParen => break,
+                Token::EqAssign => return Err(ParseError::Unsupported("default parameters")),
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                _ => return Err(ParseError::TrailingInput),
+            }
+        }
+        Ok(params)
+    }
+
+    /// Parses a braced function body and returns its statements.
+    fn function_body(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        self.expect(&Token::LeftBrace)?;
+        let mut statements = Vec::new();
+        loop {
+            while self.peek() == &Token::Semicolon {
+                self.index += 1;
+            }
+            if self.peek() == &Token::RightBrace {
+                self.index += 1;
+                break;
+            }
+            if self.peek() == &Token::Eof {
+                return Err(ParseError::UnexpectedEnd);
+            }
+            statements.push(self.statement()?);
+        }
+        Ok(statements)
     }
 
     fn if_statement(&mut self) -> Result<Stmt, ParseError> {
@@ -1176,67 +1381,125 @@ impl Parser {
 
 pub fn compile(expression: &Expr) -> Result<Compiled, CompileError> {
     let mut compiler = Compiler::new();
-    compiler.expression(expression)?;
-    compiler.emit(Instruction::return_());
+    let (_, _) = compiler.enter_function(&[], &[], Some(expression), false)?;
     Ok(compiler.finish())
 }
 
 /// Compiles a program. Statements produce no value; the final statement's
 /// value is kept only when it is an expression statement (REPL semantics),
-/// otherwise the program evaluates to `undefined`.
+/// otherwise the program evaluates to `undefined`. The main body becomes
+/// function-table entry 0, where the machine begins execution.
 pub fn compile_program(program: &[Stmt]) -> Result<Compiled, CompileError> {
     let mut compiler = Compiler::new();
-    let last_keeps_value = matches!(program.last(), Some(Stmt::Expression(_)));
-    for (index, statement) in program.iter().enumerate() {
-        let wants_value = last_keeps_value && index + 1 == program.len();
-        compiler.statement(statement, wants_value)?;
-    }
-    if !last_keeps_value {
-        compiler.emit(Instruction::load_undefined());
-    }
-    compiler.emit(Instruction::return_());
+    compiler.enter_function(&[], program, None, true)?;
     Ok(compiler.finish())
 }
 
-struct Local {
+/// One captured outer binding, as seen by the function being compiled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    /// A local slot in the immediately enclosing function.
+    Local(usize),
+    /// An upvalue of the immediately enclosing function (transitive).
+    Upvalue(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignTarget {
+    Local(usize, bool),
+    Upvalue(usize, bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolved {
+    Local { slot: usize, is_const: bool },
+    Upvalue { index: usize, is_const: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Binding {
     slot: usize,
     is_const: bool,
 }
 
+struct Scope {
+    bindings: HashMap<String, Binding>,
+}
+
+/// Per-function compilation state: its own instruction buffer, local slots,
+/// upvalue captures, and scope-stack base.
+struct FunctionState {
+    index: usize,
+    buffer: Vec<Instruction>,
+    local_count: usize,
+    captures: Vec<Capture>,
+    upvalue_map: HashMap<String, (usize, bool)>,
+    scopes_base: usize,
+    /// Names (from the entry prescan) that nested functions capture; their
+    /// declarations emit `OP_MAKE_CELL`.
+    captured_names: HashSet<String>,
+}
+
 struct Compiler {
-    instructions: Vec<Instruction>,
     /// String-constant pool; `OP_LOAD_STRING` operands index into it.
     pool: Vec<Value>,
     string_indices: HashMap<String, usize>,
-    scopes: Vec<HashMap<String, Local>>,
-    locals: usize,
+    scopes: Vec<Scope>,
+    /// The function table being built; indices are assigned when a function
+    /// is entered, and layout fields are filled when it completes.
+    functions: Vec<KeelFunction>,
+    states: Vec<FunctionState>,
+    completed: Vec<FunctionState>,
 }
 
 impl Compiler {
     fn new() -> Self {
         Self {
-            instructions: Vec::new(),
             pool: Vec::new(),
             string_indices: HashMap::new(),
-            scopes: vec![HashMap::new()],
-            locals: 0,
+            scopes: Vec::new(),
+            functions: Vec::new(),
+            states: Vec::new(),
+            completed: Vec::new(),
         }
     }
 
-    fn finish(self) -> Compiled {
+    /// Concatenates completed function buffers into the flat instruction
+    /// stream, rebasing absolute jumps, and assigns each function's
+    /// `[start, start+len)` layout. Entry 0 (main) ends up last in the
+    /// stream, which is fine: the machine starts at `functions[0].start`.
+    fn finish(mut self) -> Compiled {
+        let mut instructions = Vec::new();
+        for mut state in self.completed.drain(..) {
+            let start = instructions.len();
+            for instruction in &mut state.buffer {
+                if instruction.op == r8_abi::OP_JMP
+                    || instruction.op == r8_abi::OP_JMP_IF_FALSE
+                    || instruction.op == r8_abi::OP_JMP_IF_TRUE
+                {
+                    instruction.operand += start as i32;
+                }
+            }
+            instructions.extend(state.buffer);
+            self.functions[state.index].start = start as u32;
+            self.functions[state.index].len = (instructions.len() - start) as u32;
+        }
         Compiled {
-            instructions: self.instructions,
+            instructions,
             pool: self.pool,
+            functions: self.functions,
         }
     }
 
     fn emit(&mut self, instruction: Instruction) -> usize {
-        self.instructions.push(instruction);
-        self.instructions.len() - 1
+        let state = self.states.last_mut().expect("compiling a function");
+        state.buffer.push(instruction);
+        state.buffer.len() - 1
     }
 
     fn patch(&mut self, index: usize, target: usize) {
-        self.instructions[index].operand = target as i32;
+        let state = self.states.last_mut().expect("compiling a function");
+        state.buffer[index].operand = target as i32;
     }
 
     fn string_index(&mut self, text: &str) -> usize {
@@ -1250,25 +1513,345 @@ impl Compiler {
     }
 
     fn declare(&mut self, name: &str, is_const: bool) -> Result<usize, CompileError> {
-        let slot = self.locals;
+        let slot = self
+            .states
+            .last()
+            .expect("compiling a function")
+            .local_count;
         if slot >= LOCAL_COUNT {
             return Err(CompileError::TooManyLocals);
         }
-        self.locals += 1;
+        self.states
+            .last_mut()
+            .expect("compiling a function")
+            .local_count += 1;
         self.scopes
             .last_mut()
             .expect("a scope is always open")
-            .insert(name.to_string(), Local { slot, is_const });
+            .bindings
+            .insert(name.to_string(), Binding { slot, is_const });
         Ok(slot)
     }
 
-    fn lookup(&self, name: &str) -> Option<&Local> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(local) = scope.get(name) {
-                return Some(local);
+    fn local_bound(&self, name: &str) -> Option<Binding> {
+        let scopes_base = self
+            .states
+            .last()
+            .expect("compiling a function")
+            .scopes_base;
+        for scope in self.scopes[scopes_base..].iter().rev() {
+            if let Some(&binding) = scope.bindings.get(name) {
+                return Some(binding);
             }
         }
         None
+    }
+
+    /// Resolves `name` for the function being compiled: a local slot, or an
+    /// upvalue (building the transitive capture chain through intermediate
+    /// functions when needed).
+    fn resolve(&mut self, name: &str) -> Option<Resolved> {
+        if let Some(binding) = self.local_bound(name) {
+            return Some(Resolved::Local {
+                slot: binding.slot,
+                is_const: binding.is_const,
+            });
+        }
+        let current = self.states.last().expect("compiling a function");
+        if let Some(&(index, is_const)) = current.upvalue_map.get(name) {
+            return Some(Resolved::Upvalue { index, is_const });
+        }
+        // Find the owner scope among enclosing functions' scopes.
+        let scopes_base = current.scopes_base;
+        let mut owner = None;
+        for (i, scope) in self.scopes[..scopes_base].iter().enumerate().rev() {
+            if let Some(&binding) = scope.bindings.get(name) {
+                owner = Some((i, binding.slot, binding.is_const));
+                break;
+            }
+        }
+        let (owner_scope, owner_slot, owner_is_const) = owner?;
+        // The owner's function is the last active one containing that scope;
+        // every function from just inside it down to the current one adds a
+        // capture (transitively via upvalues).
+        let owner_fn = self
+            .states
+            .iter()
+            .rposition(|state| state.scopes_base <= owner_scope)?;
+        let mut capture = Capture::Local(owner_slot);
+        for j in (owner_fn + 1)..self.states.len() {
+            let index = self.states[j].captures.len();
+            self.states[j].captures.push(capture);
+            capture = Capture::Upvalue(index);
+        }
+        let index = self
+            .states
+            .last()
+            .expect("compiling a function")
+            .captures
+            .len()
+            - 1;
+        self.states
+            .last_mut()
+            .expect("compiling a function")
+            .upvalue_map
+            .insert(name.to_string(), (index, owner_is_const));
+        Some(Resolved::Upvalue {
+            index,
+            is_const: owner_is_const,
+        })
+    }
+
+    /// Enters a new function: assigns its table index, pushes its state,
+    /// declares parameters (with cells for captured ones), compiles the
+    /// body, and pops. Returns the table index and the capture list for the
+    /// creation site to emit.
+    fn enter_function(
+        &mut self,
+        params: &[String],
+        body: &[Stmt],
+        expr_body: Option<&Expr>,
+        wants_last_value: bool,
+    ) -> Result<(usize, Vec<Capture>), CompileError> {
+        let index = self.functions.len();
+        self.functions.push(KeelFunction {
+            start: 0,
+            len: 0,
+            local_count: 0,
+            arity: params.len() as u32,
+        });
+        self.scopes.push(Scope {
+            bindings: HashMap::new(),
+        });
+        let captured_names = Self::collect_captures(params, body, expr_body);
+        self.states.push(FunctionState {
+            index,
+            buffer: Vec::new(),
+            local_count: 0,
+            captures: Vec::new(),
+            upvalue_map: HashMap::new(),
+            scopes_base: self.scopes.len() - 1,
+            captured_names,
+        });
+        for param in params {
+            let slot = self.declare(param, false)?;
+            if self.current_captured(param) {
+                self.emit(Instruction::make_cell(slot));
+            }
+        }
+        match expr_body {
+            Some(expression) => {
+                self.expression(expression)?;
+                self.emit(Instruction::return_());
+            }
+            None => {
+                let last_keeps_value =
+                    wants_last_value && matches!(body.last(), Some(Stmt::Expression(_)));
+                for (i, statement) in body.iter().enumerate() {
+                    let wants_value = last_keeps_value && i + 1 == body.len();
+                    self.statement(statement, wants_value)?;
+                }
+                // The implicit-return tail is skipped when the body ends
+                // with an explicit `return` (which already emitted its own).
+                if !matches!(body.last(), Some(Stmt::Return(_))) {
+                    if !last_keeps_value {
+                        self.emit(Instruction::load_undefined());
+                    }
+                    self.emit(Instruction::return_());
+                }
+            }
+        }
+        let state = self.states.pop().expect("compiling a function");
+        self.scopes.pop();
+        self.functions[index].local_count = state.local_count as u32;
+        self.completed.push(state);
+        let index = self.completed.len() - 1;
+        let captures = self.completed[index].captures.clone();
+        Ok((self.completed[index].index, captures))
+    }
+
+    fn current_captured(&self, name: &str) -> bool {
+        self.states
+            .last()
+            .expect("compiling a function")
+            .captured_names
+            .contains(name)
+    }
+
+    /// Computes the set of names bound in this function that any nested
+    /// function references (shadowing-aware). Those bindings become cells.
+    fn collect_captures(
+        params: &[String],
+        body: &[Stmt],
+        expr_body: Option<&Expr>,
+    ) -> HashSet<String> {
+        let mut bound: HashSet<String> = params.iter().cloned().collect();
+        let mut captured = HashSet::new();
+        let mut free = HashSet::new();
+        Self::walk_statements(body, &mut bound, &mut captured, &mut free);
+        if let Some(expression) = expr_body {
+            Self::walk_expr(expression, &mut bound, &mut captured, &mut free);
+        }
+        captured
+    }
+
+    fn walk_statements(
+        statements: &[Stmt],
+        bound: &mut HashSet<String>,
+        captured: &mut HashSet<String>,
+        free: &mut HashSet<String>,
+    ) {
+        for statement in statements {
+            Self::walk_statement(statement, bound, captured, free);
+        }
+    }
+
+    fn walk_statement(
+        statement: &Stmt,
+        bound: &mut HashSet<String>,
+        captured: &mut HashSet<String>,
+        free: &mut HashSet<String>,
+    ) {
+        match statement {
+            Stmt::Expression(expression) => Self::walk_expr(expression, bound, captured, free),
+            Stmt::Empty => {}
+            Stmt::Let(declarators) | Stmt::Const(declarators) => {
+                for declarator in declarators {
+                    bound.insert(declarator.name.clone());
+                    if let Some(init) = &declarator.init {
+                        Self::walk_expr(init, bound, captured, free);
+                    }
+                }
+            }
+            Stmt::Block(statements) => {
+                Self::walk_statements(statements, bound, captured, free);
+            }
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                Self::walk_expr(condition, bound, captured, free);
+                Self::walk_statement(then_body, bound, captured, free);
+                if let Some(else_body) = else_body {
+                    Self::walk_statement(else_body, bound, captured, free);
+                }
+            }
+            Stmt::While { condition, body } => {
+                Self::walk_expr(condition, bound, captured, free);
+                Self::walk_statement(body, bound, captured, free);
+            }
+            Stmt::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    Self::walk_statement(init, bound, captured, free);
+                }
+                if let Some(condition) = condition {
+                    Self::walk_expr(condition, bound, captured, free);
+                }
+                if let Some(update) = update {
+                    Self::walk_expr(update, bound, captured, free);
+                }
+                Self::walk_statement(body, bound, captured, free);
+            }
+            Stmt::Function { name, params, body } => {
+                bound.insert(name.clone());
+                Self::walk_nested_function(params, body, None, bound, captured, free);
+            }
+            Stmt::Return(Some(expression)) => Self::walk_expr(expression, bound, captured, free),
+            Stmt::Return(None) => {}
+        }
+    }
+
+    fn walk_expr(
+        expression: &Expr,
+        bound: &mut HashSet<String>,
+        captured: &mut HashSet<String>,
+        free: &mut HashSet<String>,
+    ) {
+        match expression {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined => {}
+            Expr::String(_) => {}
+            Expr::Var(name) => {
+                if !bound.contains(name) {
+                    free.insert(name.clone());
+                }
+            }
+            Expr::Template(parts) => {
+                for part in parts {
+                    if let TemplatePart::Substitution(substitution) = part {
+                        Self::walk_expr(substitution, bound, captured, free);
+                    }
+                }
+            }
+            Expr::FunctionExpr { params, body } => {
+                Self::walk_nested_function(params, body, None, bound, captured, free)
+            }
+            Expr::Arrow { params, body } => match body {
+                ArrowBody::Block(statements) => {
+                    Self::walk_nested_function(params, statements, None, bound, captured, free)
+                }
+                ArrowBody::Expression(expression) => {
+                    Self::walk_nested_function(params, &[], Some(expression), bound, captured, free)
+                }
+            },
+            Expr::Assign(_, name, value) => {
+                Self::walk_expr(value, bound, captured, free);
+                // The target reads like a variable reference for capture
+                // purposes.
+                if !bound.contains(name) {
+                    free.insert(name.clone());
+                }
+            }
+            Expr::Binary(_, left, right) => {
+                Self::walk_expr(left, bound, captured, free);
+                Self::walk_expr(right, bound, captured, free);
+            }
+            Expr::Unary(_, operand) => Self::walk_expr(operand, bound, captured, free),
+            Expr::Call(callee, arguments) => {
+                Self::walk_expr(callee, bound, captured, free);
+                for argument in arguments {
+                    Self::walk_expr(argument, bound, captured, free);
+                }
+            }
+            Expr::ConsoleLog(argument) => Self::walk_expr(argument, bound, captured, free),
+        }
+    }
+
+    /// Walks a nested function body with a fresh binding set: names free in
+    /// the child that are bound here become captures; otherwise they
+    /// propagate upward as free.
+    fn walk_nested_function(
+        params: &[String],
+        body: &[Stmt],
+        expr_body: Option<&Expr>,
+        bound: &mut HashSet<String>,
+        captured: &mut HashSet<String>,
+        free: &mut HashSet<String>,
+    ) {
+        let mut child_bound: HashSet<String> = params.iter().cloned().collect();
+        let mut child_captured = HashSet::new();
+        let mut child_free = HashSet::new();
+        Self::walk_statements(body, &mut child_bound, &mut child_captured, &mut child_free);
+        if let Some(expression) = expr_body {
+            Self::walk_expr(
+                expression,
+                &mut child_bound,
+                &mut child_captured,
+                &mut child_free,
+            );
+        }
+        for name in child_free {
+            if bound.contains(&name) {
+                captured.insert(name);
+            } else {
+                free.insert(name);
+            }
+        }
     }
 
     fn expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
@@ -1279,11 +1862,16 @@ impl Compiler {
                 } else {
                     // Integers beyond `i32` go through the float path: exact
                     // up to 2^53, matching JS double semantics.
-                    self.instructions
-                        .extend(Instruction::load_f64(*value as f64));
+                    for instruction in Instruction::load_f64(*value as f64) {
+                        self.emit(instruction);
+                    }
                 }
             }
-            Expr::Float(value) => self.instructions.extend(Instruction::load_f64(*value)),
+            Expr::Float(value) => {
+                for instruction in Instruction::load_f64(*value) {
+                    self.emit(instruction);
+                }
+            }
             Expr::Bool(value) => {
                 self.emit(Instruction::load_bool(*value));
             }
@@ -1293,13 +1881,15 @@ impl Compiler {
             Expr::Undefined => {
                 self.emit(Instruction::load_undefined());
             }
-            Expr::Var(name) => {
-                let slot = self
-                    .lookup(name)
-                    .ok_or_else(|| CompileError::Undeclared(name.clone()))?
-                    .slot;
-                self.emit(Instruction::get_local(slot));
-            }
+            Expr::Var(name) => match self.resolve(name) {
+                Some(Resolved::Local { slot, .. }) => {
+                    self.emit(Instruction::get_local(slot));
+                }
+                Some(Resolved::Upvalue { index, .. }) => {
+                    self.emit(Instruction::get_upvalue(index));
+                }
+                None => return Err(CompileError::Undeclared(name.clone())),
+            },
             Expr::String(text) => {
                 let index = self.string_index(text);
                 self.emit(Instruction::load_string(index));
@@ -1335,17 +1925,53 @@ impl Compiler {
                     self.emit(Instruction::binary(r8_abi::OP_ADD));
                 }
             }
+            Expr::FunctionExpr { params, body } => {
+                let (index, captures) = self.enter_function(params, body, None, false)?;
+                self.emit_closure_creation(index, &captures);
+            }
+            Expr::Arrow { params, body } => {
+                let (index, captures) = match body {
+                    ArrowBody::Block(statements) => {
+                        self.enter_function(params, statements, None, false)?
+                    }
+                    ArrowBody::Expression(expression) => {
+                        self.enter_function(params, &[], Some(expression), false)?
+                    }
+                };
+                self.emit_closure_creation(index, &captures);
+            }
+            Expr::Call(callee, arguments) => {
+                // Callee first, then arguments: the machine pops
+                // `[fn, arg1..argN]`.
+                self.expression(callee)?;
+                for argument in arguments {
+                    self.expression(argument)?;
+                }
+                self.emit(Instruction::call(arguments.len()));
+            }
             Expr::Assign(op, name, value) => {
-                let (slot, is_const) = match self.lookup(name) {
-                    Some(local) => (local.slot, local.is_const),
+                let target = match self.resolve(name) {
+                    Some(Resolved::Local { slot, is_const }) => AssignTarget::Local(slot, is_const),
+                    Some(Resolved::Upvalue { index, is_const }) => {
+                        AssignTarget::Upvalue(index, is_const)
+                    }
                     None => return Err(CompileError::Undeclared(name.clone())),
+                };
+                let (slot, index, is_const) = match target {
+                    AssignTarget::Local(slot, is_const) => (Some(slot), None, is_const),
+                    AssignTarget::Upvalue(index, is_const) => (None, Some(index), is_const),
                 };
                 if is_const {
                     return Err(CompileError::ConstAssignment(name.clone()));
                 }
                 if *op != AssignOp::Assign {
                     // Compound assignment reads the target first.
-                    self.emit(Instruction::get_local(slot));
+                    if let Some(slot) = slot {
+                        self.emit(Instruction::get_local(slot));
+                    }
+                    if let Some(index) = index {
+                        self.emit(Instruction::get_upvalue(index));
+                    }
                 }
                 self.expression(value)?;
                 let opcode = match op {
@@ -1361,7 +1987,12 @@ impl Compiler {
                 }
                 // The assignment expression's value is the assigned value.
                 self.emit(Instruction::dup());
-                self.emit(Instruction::set_local(slot));
+                if let Some(slot) = slot {
+                    self.emit(Instruction::set_local(slot));
+                }
+                if let Some(index) = index {
+                    self.emit(Instruction::set_upvalue(index));
+                }
             }
             Expr::Binary(op, left, right) => match op {
                 BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
@@ -1377,7 +2008,12 @@ impl Compiler {
                     });
                     self.emit(Instruction::pop());
                     self.expression(right)?;
-                    let end = self.instructions.len();
+                    let end = self
+                        .states
+                        .last()
+                        .expect("compiling a function")
+                        .buffer
+                        .len();
                     self.patch(jump, end);
                 }
                 _ => {
@@ -1409,6 +2045,20 @@ impl Compiler {
         Ok(())
     }
 
+    fn emit_closure_creation(&mut self, index: usize, captures: &[Capture]) {
+        self.emit(Instruction::closure(index));
+        for capture in captures {
+            match capture {
+                Capture::Local(slot) => {
+                    self.emit(Instruction::capture_local(*slot));
+                }
+                Capture::Upvalue(upvalue) => {
+                    self.emit(Instruction::capture_upvalue(*upvalue));
+                }
+            }
+        }
+    }
+
     fn statement(&mut self, statement: &Stmt, wants_value: bool) -> Result<(), CompileError> {
         match statement {
             Stmt::Expression(expression) => {
@@ -1430,10 +2080,15 @@ impl Compiler {
                     }
                     let slot = self.declare(&declarator.name, is_const)?;
                     self.emit(Instruction::set_local(slot));
+                    if self.current_captured(&declarator.name) {
+                        self.emit(Instruction::make_cell(slot));
+                    }
                 }
             }
             Stmt::Block(statements) => {
-                self.scopes.push(HashMap::new());
+                self.scopes.push(Scope {
+                    bindings: HashMap::new(),
+                });
                 for statement in statements {
                     self.statement(statement, false)?;
                 }
@@ -1450,25 +2105,50 @@ impl Compiler {
                 match else_body {
                     Some(else_body) => {
                         let end_jump = self.emit(Instruction::jmp(0));
-                        let else_start = self.instructions.len();
+                        let else_start = self
+                            .states
+                            .last()
+                            .expect("compiling a function")
+                            .buffer
+                            .len();
                         self.patch(else_jump, else_start);
                         self.statement(else_body, false)?;
-                        let end = self.instructions.len();
+                        let end = self
+                            .states
+                            .last()
+                            .expect("compiling a function")
+                            .buffer
+                            .len();
                         self.patch(end_jump, end);
                     }
                     None => {
-                        let end = self.instructions.len();
+                        let end = self
+                            .states
+                            .last()
+                            .expect("compiling a function")
+                            .buffer
+                            .len();
                         self.patch(else_jump, end);
                     }
                 }
             }
             Stmt::While { condition, body } => {
-                let loop_start = self.instructions.len();
+                let loop_start = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
                 self.expression(condition)?;
                 let end_jump = self.emit(Instruction::jmp_if_false(0));
                 self.statement(body, false)?;
                 self.emit(Instruction::jmp(loop_start));
-                let end = self.instructions.len();
+                let end = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
                 self.patch(end_jump, end);
             }
             Stmt::For {
@@ -1479,11 +2159,18 @@ impl Compiler {
             } => {
                 // The whole `for` statement owns one scope for its init
                 // declarations; per-iteration bindings arrive with closures.
-                self.scopes.push(HashMap::new());
+                self.scopes.push(Scope {
+                    bindings: HashMap::new(),
+                });
                 if let Some(init) = init {
                     self.statement(init, false)?;
                 }
-                let loop_start = self.instructions.len();
+                let loop_start = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
                 match condition {
                     Some(condition) => self.expression(condition)?,
                     None => {
@@ -1497,9 +2184,36 @@ impl Compiler {
                     self.emit(Instruction::pop());
                 }
                 self.emit(Instruction::jmp(loop_start));
-                let end = self.instructions.len();
+                let end = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
                 self.patch(end_jump, end);
                 self.scopes.pop();
+            }
+            Stmt::Function { name, params, body } => {
+                let slot = self.declare(name, false)?;
+                // The function's own cell exists before its closure is
+                // created, so a self-referencing body (recursion) captures
+                // it and reads the binding once it is assigned.
+                let (index, captures) = self.enter_function(params, body, None, false)?;
+                self.emit(Instruction::load_undefined());
+                self.emit(Instruction::set_local(slot));
+                if self.current_captured(name) {
+                    self.emit(Instruction::make_cell(slot));
+                }
+                self.emit_closure_creation(index, &captures);
+                self.emit(Instruction::set_local(slot));
+            }
+            Stmt::Return(Some(expression)) => {
+                self.expression(expression)?;
+                self.emit(Instruction::return_());
+            }
+            Stmt::Return(None) => {
+                self.emit(Instruction::load_undefined());
+                self.emit(Instruction::return_());
             }
         }
         Ok(())
@@ -2388,5 +3102,303 @@ mod tests {
             ]
         );
         assert_eq!(compiled.instructions[3].op, r8_abi::OP_PRINT);
+    }
+
+    #[test]
+    fn lexes_function_and_arrow_tokens() {
+        assert_eq!(
+            tokenize("function =>").unwrap(),
+            vec![Token::Function, Token::EqArrow, Token::Eof]
+        );
+        // `=>` is distinct from `==` and `=`.
+        assert_eq!(
+            tokenize("a == b = c").unwrap(),
+            vec![
+                Token::Identifier("a".into()),
+                Token::EqEq,
+                Token::Identifier("b".into()),
+                Token::EqAssign,
+                Token::Identifier("c".into()),
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_function_declaration() {
+        let program = parse_program("function add(a, b) { return a + b; }").unwrap();
+        assert_eq!(program.len(), 1);
+        assert_eq!(
+            program[0],
+            Stmt::Function {
+                name: "add".into(),
+                params: vec!["a".into(), "b".into()],
+                body: vec![Stmt::Return(Some(Expr::Binary(
+                    BinaryOp::Add,
+                    Box::new(Expr::Var("a".into())),
+                    Box::new(Expr::Var("b".into()))
+                )))]
+            }
+        );
+    }
+
+    #[test]
+    fn parses_return_statements() {
+        let program = parse_program("function f() { return; }").unwrap();
+        assert_eq!(
+            program[0],
+            Stmt::Function {
+                name: "f".into(),
+                params: vec![],
+                body: vec![Stmt::Return(None)]
+            }
+        );
+    }
+
+    #[test]
+    fn parses_arrow_forms() {
+        // Single param without parens.
+        assert_eq!(
+            parse("x => x * 2").unwrap(),
+            Expr::Arrow {
+                params: vec!["x".into()],
+                body: ArrowBody::Expression(Box::new(Expr::Binary(
+                    BinaryOp::Mul,
+                    Box::new(Expr::Var("x".into())),
+                    Box::new(Expr::Int(2))
+                )))
+            }
+        );
+        // Multiple params with parens and a block body.
+        let arrow = parse("(a, b) => { return a + b; }").unwrap();
+        assert_eq!(
+            arrow,
+            Expr::Arrow {
+                params: vec!["a".into(), "b".into()],
+                body: ArrowBody::Block(vec![Stmt::Return(Some(Expr::Binary(
+                    BinaryOp::Add,
+                    Box::new(Expr::Var("a".into())),
+                    Box::new(Expr::Var("b".into()))
+                )))])
+            }
+        );
+        // Zero params.
+        assert_eq!(
+            parse("() => 42").unwrap(),
+            Expr::Arrow {
+                params: vec![],
+                body: ArrowBody::Expression(Box::new(Expr::Int(42)))
+            }
+        );
+    }
+
+    #[test]
+    fn parens_are_not_always_arrows() {
+        // A parenthesized expression is not arrow params.
+        assert_eq!(
+            parse("(a + b)").unwrap(),
+            Expr::Binary(
+                BinaryOp::Add,
+                Box::new(Expr::Var("a".into())),
+                Box::new(Expr::Var("b".into()))
+            )
+        );
+        // A lone parenthesized identifier followed by more tokens.
+        assert!(parse("(a) + 1").is_ok());
+    }
+
+    #[test]
+    fn parses_calls() {
+        assert_eq!(
+            parse("add(2, 3)").unwrap(),
+            Expr::Call(
+                Box::new(Expr::Var("add".into())),
+                vec![Expr::Int(2), Expr::Int(3)]
+            )
+        );
+        // Calls chain, and arrows can be arguments.
+        assert!(matches!(parse("f(x)(y)").unwrap(), Expr::Call(_, _)));
+        assert!(matches!(
+            parse("twice((v) => v + 1, 5)").unwrap(),
+            Expr::Call(_, _)
+        ));
+    }
+
+    #[test]
+    fn parses_function_expression() {
+        assert!(matches!(
+            parse("function (x) { return x; }").unwrap(),
+            Expr::FunctionExpr { .. }
+        ));
+        assert_eq!(
+            parse("function named() {}").unwrap_err(),
+            ParseError::Unsupported("named function expressions")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_parameters() {
+        assert_eq!(
+            parse_program("function f(a, b = 1) {}").unwrap_err(),
+            ParseError::Unsupported("default parameters")
+        );
+        assert_eq!(
+            parse_program("function f(1) {}").unwrap_err(),
+            ParseError::Unsupported("only simple parameter names")
+        );
+    }
+
+    #[test]
+    fn compiles_function_declaration_with_table_entry() {
+        let program = parse_program("function f() { return 7; } f()").unwrap();
+        let compiled = compile_program(&program).unwrap();
+        // Buffers concatenate in completion order, so f's body (which
+        // completed first) precedes main; execution starts at
+        // functions[0].start.
+        assert_eq!(
+            compiled.instructions,
+            vec![
+                // f's body
+                Instruction::load_int(7),
+                Instruction::return_(),
+                // main: declaration creation sequence, then the call site
+                Instruction::load_undefined(),
+                Instruction::set_local(0),
+                Instruction::closure(1),
+                Instruction::set_local(0),
+                // f()
+                Instruction::get_local(0),
+                Instruction::call(0),
+                Instruction::return_(),
+            ]
+        );
+        assert_eq!(compiled.functions.len(), 2);
+        assert_eq!(
+            compiled.functions[0],
+            KeelFunction {
+                start: 2,
+                len: 7,
+                local_count: 1,
+                arity: 0,
+            }
+        );
+        assert_eq!(
+            compiled.functions[1],
+            KeelFunction {
+                start: 0,
+                len: 2,
+                local_count: 0,
+                arity: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn compiles_captured_locals_with_cells() {
+        let program = parse_program("let c = 0; const inc = () => { c += 1; }; inc(); c").unwrap();
+        let compiled = compile_program(&program).unwrap();
+        let instructions = &compiled.instructions;
+        // Main starts after the arrow's body in the flat stream.
+        let main_start = compiled.functions[0].start as usize;
+        // c's declaration ends with MAKE_CELL; the closure captures it.
+        assert_eq!(
+            instructions[main_start..main_start + 6],
+            vec![
+                Instruction::load_int(0),
+                Instruction::set_local(0),
+                Instruction::make_cell(0),
+                Instruction::closure(1),
+                Instruction::capture_local(0),
+                Instruction::set_local(1),
+            ]
+        );
+        // The arrow body reads and writes the upvalue; the statement value
+        // is popped and the implicit-return tail follows.
+        let body_start = compiled.functions[1].start as usize;
+        assert_eq!(
+            instructions[body_start..body_start + 8],
+            vec![
+                Instruction::get_upvalue(0),
+                Instruction::load_int(1),
+                Instruction::binary(OP_ADD),
+                Instruction::dup(),
+                Instruction::set_upvalue(0),
+                Instruction::pop(),
+                Instruction::load_undefined(),
+                Instruction::return_(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_transitive_captures() {
+        let program = parse_program("let x = 1; const outer = () => () => x;").unwrap();
+        let compiled = compile_program(&program).unwrap();
+        let instructions = &compiled.instructions;
+        // The inner arrow's body comes first (completion order).
+        let inner_start = compiled.functions[2].start as usize;
+        assert_eq!(
+            instructions[inner_start..inner_start + 2],
+            vec![Instruction::get_upvalue(0), Instruction::return_()]
+        );
+        // The outer arrow's body is itself an expression body arrow: it
+        // creates the inner closure and returns it.
+        let outer_start = compiled.functions[1].start as usize;
+        assert_eq!(
+            instructions[outer_start..outer_start + 3],
+            vec![
+                Instruction::closure(2),
+                Instruction::capture_upvalue(0),
+                Instruction::return_(),
+            ]
+        );
+        // Main: x's declaration (captured, so it gets a cell), then
+        // closure(1); capture_local(0); set_local(1) for `outer`.
+        let main_start = compiled.functions[0].start as usize;
+        assert_eq!(
+            instructions[main_start + 3..main_start + 6],
+            vec![
+                Instruction::closure(1),
+                Instruction::capture_local(0),
+                Instruction::set_local(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_recursion_through_self_capture() {
+        let program = parse_program(
+            "function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); } fact(5)",
+        )
+        .unwrap();
+        let compiled = compile_program(&program).unwrap();
+        let instructions = &compiled.instructions;
+        // fact's body comes first (completion order); it reads fact through
+        // its upvalue cell for the recursive call.
+        let body_start = compiled.functions[1].start as usize;
+        assert!(
+            instructions[body_start..]
+                .iter()
+                .any(|i| i.op == r8_abi::OP_GET_UPVALUE)
+        );
+        // Jumps inside the body are rebased to the flat stream. The `if`
+        // jumps past its two-instruction then-branch (load + return).
+        let jump = instructions[body_start..]
+            .iter()
+            .find(|i| i.op == r8_abi::OP_JMP_IF_FALSE)
+            .unwrap();
+        assert_eq!(jump.operand as usize, body_start + 6);
+        // Main: fact's declaration pre-creates its cell and self-captures.
+        let main_start = compiled.functions[0].start as usize;
+        assert_eq!(
+            instructions[main_start..main_start + 5],
+            vec![
+                Instruction::load_undefined(),
+                Instruction::set_local(0),
+                Instruction::make_cell(0),
+                Instruction::closure(1),
+                Instruction::capture_local(0),
+            ]
+        );
     }
 }

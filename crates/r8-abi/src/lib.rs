@@ -14,8 +14,14 @@
 //! machine-owned memory), the string-constant pool passed to a widened
 //! `r8_machine_run` signature, `OP_LOAD_STRING` (pool index operand), and
 //! `OP_TO_STRING` for template-literal substitution.
+//!
+//! ABI v5 adds functions: `TAG_FUNCTION` (payload points at a machine-owned
+//! function object with captured upvalue cells), a function table (`start`,
+//! `len`, `local_count`, `arity` per function, bodies inline in the flat
+//! instruction stream), closure creation and capture opcodes, upvalue
+//! access, and call frames inside the machine.
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// Value tags. `CONFORMANCE_TAGS` lists these in a canonical order; keep both
 /// in sync with `zig/src/abi.zig`.
@@ -26,6 +32,7 @@ pub const TAG_BOOL: u32 = 4;
 pub const TAG_NULL: u32 = 5;
 pub const TAG_UNDEFINED: u32 = 6;
 pub const TAG_STRING: u32 = 7;
+pub const TAG_FUNCTION: u32 = 8;
 
 /// Opcodes. `CONFORMANCE_OPS` lists these in a canonical order; keep both in
 /// sync with `zig/src/abi.zig`.
@@ -82,6 +89,26 @@ pub const OP_LOAD_STRING: u32 = 31;
 /// Pops a value and pushes its JS `String()` rendering as a string value
 /// (used by template-literal substitutions).
 pub const OP_TO_STRING: u32 = 32;
+/// Pushes a function value for table entry `operand`; upvalue captures
+/// (which follow immediately) append to its environment.
+pub const OP_CLOSURE: u32 = 33;
+/// Appends the cell of parent local slot `operand` to the function under
+/// construction (the value on top of the stack).
+pub const OP_CAPTURE_LOCAL: u32 = 34;
+/// Appends the parent's upvalue cell `operand` to the function under
+/// construction (transitive captures).
+pub const OP_CAPTURE_UPVALUE: u32 = 35;
+/// Pushes upvalue `operand` of the current function's environment.
+pub const OP_GET_UPVALUE: u32 = 36;
+/// Pops a value and stores it into upvalue `operand`'s cell.
+pub const OP_SET_UPVALUE: u32 = 37;
+/// Moves local slot `operand`'s value into a fresh heap cell (a captured
+/// binding); subsequent `OP_GET_LOCAL`/`OP_SET_LOCAL` route through it.
+pub const OP_MAKE_CELL: u32 = 38;
+/// Calls the function value on the stack with the `operand` arguments above
+/// it: pops both, pushes a call frame, and enters the function body. Missing
+/// arguments read as `undefined`; extras are ignored.
+pub const OP_CALL: u32 = 39;
 
 /// Canonical tag order mirrored by `zig/src/abi.zig` for conformance probes.
 /// New tags are appended at the end so existing indices stay stable.
@@ -93,6 +120,7 @@ pub const CONFORMANCE_TAGS: &[u32] = &[
     TAG_NULL,
     TAG_UNDEFINED,
     TAG_STRING,
+    TAG_FUNCTION,
 ];
 
 /// Canonical opcode order mirrored by `zig/src/abi.zig` for conformance probes.
@@ -131,6 +159,13 @@ pub const CONFORMANCE_OPS: &[u32] = &[
     OP_JMP_IF_TRUE,
     OP_LOAD_STRING,
     OP_TO_STRING,
+    OP_CLOSURE,
+    OP_CAPTURE_LOCAL,
+    OP_CAPTURE_UPVALUE,
+    OP_GET_UPVALUE,
+    OP_SET_UPVALUE,
+    OP_MAKE_CELL,
+    OP_CALL,
 ];
 
 #[repr(C)]
@@ -215,6 +250,18 @@ pub struct KeelString {
     pub len: usize,
 }
 
+/// One function's bytecode layout: a `[start, start+len)` range of the flat
+/// instruction stream (self-terminating with `OP_RETURN`), its private local
+/// slot count, and its parameter count. Entry 0 is the program's main body.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeelFunction {
+    pub start: u32,
+    pub len: u32,
+    pub local_count: u32,
+    pub arity: u32,
+}
+
 impl Value {
     /// Builds a pool constant for `bytes`. The bytes are copied and leaked:
     /// pool constants intentionally live for the process lifetime, which is
@@ -249,6 +296,7 @@ impl std::fmt::Display for Value {
                 Some(text) => f.write_str(text),
                 None => f.write_str("<string>"),
             },
+            TAG_FUNCTION => f.write_str("[function]"),
             // Placeholder until objects exist (Phase 5).
             TAG_OBJECT => f.write_str("[object]"),
             _ => write!(f, "<value tag={}>", self.tag),
@@ -385,6 +433,55 @@ impl Instruction {
         }
     }
 
+    pub const fn closure(index: usize) -> Self {
+        Self {
+            op: OP_CLOSURE,
+            operand: index as i32,
+        }
+    }
+
+    pub const fn capture_local(slot: usize) -> Self {
+        Self {
+            op: OP_CAPTURE_LOCAL,
+            operand: slot as i32,
+        }
+    }
+
+    pub const fn capture_upvalue(index: usize) -> Self {
+        Self {
+            op: OP_CAPTURE_UPVALUE,
+            operand: index as i32,
+        }
+    }
+
+    pub const fn get_upvalue(index: usize) -> Self {
+        Self {
+            op: OP_GET_UPVALUE,
+            operand: index as i32,
+        }
+    }
+
+    pub const fn set_upvalue(index: usize) -> Self {
+        Self {
+            op: OP_SET_UPVALUE,
+            operand: index as i32,
+        }
+    }
+
+    pub const fn make_cell(slot: usize) -> Self {
+        Self {
+            op: OP_MAKE_CELL,
+            operand: slot as i32,
+        }
+    }
+
+    pub const fn call(arg_count: usize) -> Self {
+        Self {
+            op: OP_CALL,
+            operand: arg_count as i32,
+        }
+    }
+
     pub const fn print() -> Self {
         Self {
             op: OP_PRINT,
@@ -457,16 +554,19 @@ impl Instruction {
 
 unsafe extern "C" {
     pub fn r8_abi_version() -> u32;
-    /// Runs bytecode with a constant pool. Pool entries referenced by
-    /// `OP_LOAD_STRING` (tag `TAG_STRING`) are copied into the machine's
-    /// arena when loaded, so the pool only needs to outlive the call.
-    /// Returned string values point into the machine's arena and are valid
-    /// until the next call resets it.
+    /// Runs bytecode with a constant pool and a function table. Pool entries
+    /// referenced by `OP_LOAD_STRING` (tag `TAG_STRING`) are copied into the
+    /// machine's arena when loaded, so the pool only needs to outlive the
+    /// call. The function table likewise only needs to outlive the call.
+    /// Returned string and function values point into the machine's arena
+    /// and are valid until the next call resets it.
     pub fn r8_machine_run(
         instructions: *const Instruction,
         len: usize,
         pool: *const Value,
         pool_len: usize,
+        functions: *const KeelFunction,
+        functions_len: usize,
     ) -> Value;
 
     /// Conformance probes exported by `zig/src/abi.zig`: the Zig machine

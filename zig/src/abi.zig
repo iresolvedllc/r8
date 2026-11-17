@@ -1,10 +1,11 @@
 //! ABI version note: this file hand-mirrors `crates/r8-abi`. ABI v2 added
 //! doubles/booleans/print; ABI v3 added locals, DUP, and jumps; ABI v4 adds
-//! strings (TAG_STRING, constant pool, LOAD_STRING/TO_STRING).
+//! strings (TAG_STRING, constant pool, LOAD_STRING/TO_STRING); ABI v5 adds
+//! functions (TAG_FUNCTION, function table, closure/capture opcodes).
 
 const std = @import("std");
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// Value tags. Mirrors `crates/r8-abi`'s constants; the `CONFORMANCE_TAGS`
 /// table below lists them in the same canonical order — keep both in sync.
@@ -15,6 +16,7 @@ pub const TAG_BOOL: u32 = 4;
 pub const TAG_NULL: u32 = 5;
 pub const TAG_UNDEFINED: u32 = 6;
 pub const TAG_STRING: u32 = 7;
+pub const TAG_FUNCTION: u32 = 8;
 
 /// Opcodes. Mirrors `crates/r8-abi`; the `CONFORMANCE_OPS` table below lists
 /// them in the same canonical order — keep both in sync.
@@ -71,9 +73,29 @@ pub const OP_LOAD_STRING: u32 = 31;
 /// Pops a value and pushes its JS `String()` rendering as a string value
 /// (used by template-literal substitutions).
 pub const OP_TO_STRING: u32 = 32;
+/// Pushes a function value for table entry `operand`; upvalue captures
+/// (which follow immediately) append to its environment.
+pub const OP_CLOSURE: u32 = 33;
+/// Appends the cell of parent local slot `operand` to the function under
+/// construction (the value on top of the stack).
+pub const OP_CAPTURE_LOCAL: u32 = 34;
+/// Appends the parent's upvalue cell `operand` to the function under
+/// construction (transitive captures).
+pub const OP_CAPTURE_UPVALUE: u32 = 35;
+/// Pushes upvalue `operand` of the current function's environment.
+pub const OP_GET_UPVALUE: u32 = 36;
+/// Pops a value and stores it into upvalue `operand`'s cell.
+pub const OP_SET_UPVALUE: u32 = 37;
+/// Moves local slot `operand`'s value into a fresh heap cell (a captured
+/// binding); subsequent `OP_GET_LOCAL`/`OP_SET_LOCAL` route through it.
+pub const OP_MAKE_CELL: u32 = 38;
+/// Calls the function value on the stack with the `operand` arguments above
+/// it: pops both, pushes a call frame, and enters the function body. Missing
+/// arguments read as `undefined`; extras are ignored.
+pub const OP_CALL: u32 = 39;
 
 /// Canonical tag order mirrored from `crates/r8-abi`'s `CONFORMANCE_TAGS`.
-const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED, TAG_STRING };
+const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED, TAG_STRING, TAG_FUNCTION };
 
 /// Canonical opcode order mirrored from `crates/r8-abi`'s `CONFORMANCE_OPS`.
 /// New opcodes are appended at the end so existing indices stay stable.
@@ -111,6 +133,13 @@ const CONFORMANCE_OPS = [_]u32{
     OP_JMP_IF_TRUE,
     OP_LOAD_STRING,
     OP_TO_STRING,
+    OP_CLOSURE,
+    OP_CAPTURE_LOCAL,
+    OP_CAPTURE_UPVALUE,
+    OP_GET_UPVALUE,
+    OP_SET_UPVALUE,
+    OP_MAKE_CELL,
+    OP_CALL,
 };
 
 pub const Value = extern struct {
@@ -207,12 +236,20 @@ pub const KeelString = extern struct {
     len: usize,
 };
 
+/// One function's bytecode layout; mirrors `crates/r8-abi`'s `KeelFunction`.
+pub const KeelFunction = extern struct {
+    start: u32,
+    len: u32,
+    local_count: u32,
+    arity: u32,
+};
+
 comptime {
     if (@sizeOf(Value) != 16) @compileError("Value must be 16 bytes");
     if (@alignOf(Value) != 8) @compileError("Value must align to 8");
     if (@sizeOf(Instruction) != 8) @compileError("Instruction must be 8 bytes");
-    if (CONFORMANCE_TAGS.len != 7) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
-    if (CONFORMANCE_OPS.len != 33) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
+    if (CONFORMANCE_TAGS.len != 8) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
+    if (CONFORMANCE_OPS.len != 40) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
 }
 
 pub export fn r8_abi_version() u32 {

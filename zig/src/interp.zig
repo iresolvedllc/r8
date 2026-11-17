@@ -51,15 +51,43 @@ fn allocStringFrom(ptr: [*]const u8, len: usize) abi.Value {
 /// comparisons are numeric; equality distinguishes loose from strict;
 /// every value prints exactly like JS `Number::toString` / `String()`.
 ///
-/// Locals are a flat array of slots; the compiler gives every declaration
-/// its own slot (block shadowing then needs no runtime save/restore) and
-/// pads slots with `undefined` so uninitialized reads are JS-shaped.
+/// Locals are a flat array; each call frame owns a region of it (base +
+/// per-function `local_count`), so recursion nests naturally. Block
+/// shadowing needs no runtime save/restore because every declaration gets
+/// its own frame-relative slot. Captured bindings are moved into heap cells
+/// (`OP_MAKE_CELL`); access routes through the cell transparently, and
+/// closures hold cell pointers, so mutation semantics are JS-correct and
+/// cells outlive their frame.
+///
+/// Function bodies live inline in the flat instruction stream, referenced
+/// through a `KeelFunction` table (`start`, `len`, `local_count`, `arity`);
+/// entry 0 is the main body where execution begins.
 
-const LOCAL_COUNT = 256;
+const LOCAL_CAPACITY = 512;
+const MAX_FRAMES = 64;
+const MAX_ARGS = 32;
 
-fn localSlot(operand: i32) usize {
-    const slot: usize = @intCast(operand);
-    if (slot >= LOCAL_COUNT) @panic("local slot out of range");
+const Cell = struct {
+    value: abi.Value,
+};
+
+const FunctionObject = struct {
+    index: usize,
+    env: std.ArrayList(?*Cell) = .empty,
+};
+
+const Frame = struct {
+    return_pc: usize,
+    stack_base: usize,
+    locals_base: usize,
+    /// The running function's object (holds its upvalue cells); null for
+    /// the main frame.
+    function: ?*FunctionObject,
+};
+
+fn localSlot(locals_base: usize, operand: i32) usize {
+    const slot = locals_base + @as(usize, @intCast(operand));
+    if (slot >= LOCAL_CAPACITY) @panic("local slot out of range");
     return slot;
 }
 
@@ -94,14 +122,35 @@ const Arithmetic = enum { add, sub, mul, div, mod, pow };
 const Compare = enum { lt, gt, le, ge };
 const Equality = enum { loose, strict };
 
-pub fn run(instructions: []const abi.Instruction, pool: []const abi.Value) abi.Value {
+pub fn run(
+    instructions: []const abi.Instruction,
+    pool: []const abi.Value,
+    functions: []const abi.KeelFunction,
+) abi.Value {
     acquireMachine();
     defer releaseMachine();
     resetStringArena();
     var stack: Stack = .{};
-    var locals: [LOCAL_COUNT]abi.Value = undefined;
+    var locals: [LOCAL_CAPACITY]abi.Value = undefined;
     for (&locals) |*slot| slot.* = abi.Value.UNDEF;
+    var cells: [LOCAL_CAPACITY]?*Cell = undefined;
+    for (&cells) |*cell| cell.* = null;
+    var frames: [MAX_FRAMES]Frame = undefined;
+    var fp: usize = 0;
+    var locals_top: usize = 0;
     var pc: usize = 0;
+    // The closure under construction between `OP_CLOSURE` and its captures.
+    var building: ?*FunctionObject = null;
+
+    // Entry 0 is the main body where execution begins.
+    const main_entry: abi.KeelFunction = if (functions.len > 0)
+        functions[0]
+    else
+        .{ .start = 0, .len = 0, .local_count = 0, .arity = 0 };
+    pc = main_entry.start;
+    locals_top = main_entry.local_count;
+    frames[0] = .{ .return_pc = instructions.len, .stack_base = 0, .locals_base = 0, .function = null };
+    fp = 1;
 
     while (pc < instructions.len) {
         const instruction = instructions[pc];
@@ -165,8 +214,65 @@ pub fn run(instructions: []const abi.Instruction, pool: []const abi.Value) abi.V
                 stack.push(value);
                 stack.push(value);
             },
-            abi.OP_GET_LOCAL => stack.push(locals[localSlot(instruction.operand)]),
-            abi.OP_SET_LOCAL => locals[localSlot(instruction.operand)] = stack.pop(),
+            abi.OP_GET_LOCAL => {
+                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
+                if (cells[slot]) |cell| {
+                    stack.push(cell.value);
+                } else {
+                    stack.push(locals[slot]);
+                }
+            },
+            abi.OP_SET_LOCAL => {
+                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
+                const value = stack.pop();
+                if (cells[slot]) |cell| {
+                    cell.value = value;
+                } else {
+                    locals[slot] = value;
+                }
+            },
+            abi.OP_MAKE_CELL => {
+                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
+                const cell = machineAllocator().create(Cell) catch @panic("out of memory");
+                cell.* = .{ .value = locals[slot] };
+                cells[slot] = cell;
+            },
+
+            abi.OP_CLOSURE => {
+                const index: usize = @intCast(instruction.operand);
+                if (index >= functions.len) @panic("function index out of range");
+                const fo = machineAllocator().create(FunctionObject) catch @panic("out of memory");
+                fo.* = .{ .index = index };
+                building = fo;
+                stack.push(.{
+                    .tag = abi.TAG_FUNCTION,
+                    ._pad = 0,
+                    .payload = @bitCast(@as(i64, @intCast(@intFromPtr(fo)))),
+                });
+            },
+            abi.OP_CAPTURE_LOCAL => {
+                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
+                const cell = cells[slot] orelse @panic("capturing a local without a cell");
+                building.?.env.append(machineAllocator(), cell) catch @panic("out of memory");
+            },
+            abi.OP_CAPTURE_UPVALUE => {
+                const index: usize = @intCast(instruction.operand);
+                const parent = frames[fp - 1].function orelse @panic("capture from the main frame");
+                if (index >= parent.env.items.len) @panic("upvalue index out of range");
+                building.?.env.append(machineAllocator(), parent.env.items[index].?) catch @panic("out of memory");
+            },
+            abi.OP_GET_UPVALUE => {
+                const index: usize = @intCast(instruction.operand);
+                const fo = frames[fp - 1].function orelse @panic("upvalue access in the main frame");
+                if (index >= fo.env.items.len) @panic("upvalue index out of range");
+                stack.push(fo.env.items[index].?.value);
+            },
+            abi.OP_SET_UPVALUE => {
+                const index: usize = @intCast(instruction.operand);
+                const fo = frames[fp - 1].function orelse @panic("upvalue access in the main frame");
+                if (index >= fo.env.items.len) @panic("upvalue index out of range");
+                fo.env.items[index].?.value = stack.pop();
+            },
 
             abi.OP_JMP => pc = jumpTarget(instruction.operand),
             abi.OP_JMP_IF_FALSE => {
@@ -196,7 +302,47 @@ pub fn run(instructions: []const abi.Instruction, pool: []const abi.Value) abi.V
                 }
             },
 
-            abi.OP_RETURN => return stack.top(),
+            abi.OP_CALL => {
+                const arg_count: usize = @intCast(instruction.operand);
+                if (arg_count > MAX_ARGS) @panic("too many arguments");
+                if (stack.sp < arg_count + 1) @panic("stack underflow in call");
+                var args: [MAX_ARGS]abi.Value = undefined;
+                for (0..arg_count) |i| args[i] = stack.values[stack.sp - arg_count + i];
+                const fn_value = stack.values[stack.sp - arg_count - 1];
+                stack.sp -= arg_count + 1;
+                if (fn_value.tag != abi.TAG_FUNCTION) @panic("call of a non-function value");
+                const fo: *FunctionObject = @ptrFromInt(@as(usize, @bitCast(fn_value.payload)));
+                if (fo.index >= functions.len) @panic("function index out of range");
+                const entry = functions[fo.index];
+                if (fp >= MAX_FRAMES) @panic("call stack overflow");
+                const base = locals_top;
+                locals_top += entry.local_count;
+                if (locals_top > LOCAL_CAPACITY) @panic("too many locals");
+                for (0..entry.local_count) |i| cells[base + i] = null;
+                for (0..entry.arity) |i| {
+                    // Missing arguments read as `undefined` (JS semantics).
+                    locals[base + i] = if (i < arg_count) args[i] else abi.Value.UNDEF;
+                }
+                frames[fp] = .{
+                    .return_pc = pc,
+                    .stack_base = stack.sp,
+                    .locals_base = base,
+                    .function = fo,
+                };
+                fp += 1;
+                pc = entry.start;
+            },
+
+            abi.OP_RETURN => {
+                const frame = frames[fp - 1];
+                const value = if (stack.sp > frame.stack_base) stack.pop() else abi.Value.UNDEF;
+                fp -= 1;
+                stack.sp = frame.stack_base;
+                locals_top = frame.locals_base;
+                if (fp == 0) return value; // returned from the main frame
+                pc = frame.return_pc;
+                stack.push(value);
+            },
             else => @panic("unknown opcode"),
         }
     }
@@ -209,8 +355,10 @@ pub export fn r8_machine_run(
     len: usize,
     pool: [*]const abi.Value,
     pool_len: usize,
+    functions: [*]const abi.KeelFunction,
+    functions_len: usize,
 ) abi.Value {
-    return run(instructions[0..len], pool[0..pool_len]);
+    return run(instructions[0..len], pool[0..pool_len], functions[0..functions_len]);
 }
 
 fn binaryArithmetic(kind: Arithmetic, stack: *Stack) void {
@@ -517,20 +665,20 @@ test "interpreter adds" {
         .{ .op = abi.OP_ADD, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    const value = run(&instructions, &[_]abi.Value{});
+    const value = run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{});
     try std.testing.expectEqual(@as(?i64, 2), value.asInt());
 }
 
 test "arithmetic promotes and follows js semantics" {
     const expectInt = struct {
         fn call(instructions: []const abi.Instruction, expected: i64) !void {
-            const value = run(instructions, &[_]abi.Value{});
+            const value = run(instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{});
             try std.testing.expectEqual(@as(?i64, expected), value.asInt());
         }
     }.call;
     const expectFloat = struct {
         fn call(instructions: []const abi.Instruction, expected: f64) !void {
-            const value = run(instructions, &[_]abi.Value{});
+            const value = run(instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{});
             const actual = value.asFloat() orelse return error.NotAFloat;
             if (std.math.isNan(expected)) {
                 // NaN has many bit patterns; only its class is observable.
@@ -592,7 +740,7 @@ test "comparisons and equality" {
                 .{ .op = op, .operand = 0 },
                 .{ .op = abi.OP_RETURN, .operand = 0 },
             };
-            return run(&instructions, &[_]abi.Value{}).asBool().?;
+            return run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asBool().?;
         }
     }.call;
 
@@ -617,7 +765,7 @@ test "comparisons and equality" {
                 .{ .op = op, .operand = 0 },
                 .{ .op = abi.OP_RETURN, .operand = 0 },
             };
-            return run(&instructions, &[_]abi.Value{}).asBool().?;
+            return run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asBool().?;
         }
     }.call;
     try std.testing.expect(loose(abi.OP_LOAD_NULL, abi.OP_LOAD_UNDEFINED, abi.OP_EQ));
@@ -632,7 +780,7 @@ test "unary neg and not" {
         .{ .op = abi.OP_NEG, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    const negated = run(&neg_zero, &[_]abi.Value{});
+    const negated = run(&neg_zero, &[_]abi.Value{}, &[_]abi.KeelFunction{});
     try std.testing.expectEqual(@as(f64, -0.0), negated.asFloat().?);
 
     const not_zero = [_]abi.Instruction{
@@ -640,20 +788,20 @@ test "unary neg and not" {
         .{ .op = abi.OP_NOT, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    try std.testing.expect(run(&not_zero, &[_]abi.Value{}).asBool().?);
+    try std.testing.expect(run(&not_zero, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asBool().?);
 
     const not_one = [_]abi.Instruction{
         .{ .op = abi.OP_LOAD_INT, .operand = 1 },
         .{ .op = abi.OP_NOT, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    try std.testing.expect(!run(&not_one, &[_]abi.Value{}).asBool().?);
+    try std.testing.expect(!run(&not_one, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asBool().?);
 }
 
 test "float literals load through the two-instruction encoding" {
     const load = abi.Instruction.loadF64(0.30000000000000004);
     const instructions = [_]abi.Instruction{ load[0], load[1], .{ .op = abi.OP_RETURN, .operand = 0 } };
-    const value = run(&instructions, &[_]abi.Value{});
+    const value = run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{});
     try std.testing.expectEqual(@as(?f64, 0.30000000000000004), value.asFloat());
 }
 
@@ -663,7 +811,7 @@ test "print pops and leaves undefined" {
         .{ .op = abi.OP_PRINT, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    const value = run(&instructions, &[_]abi.Value{});
+    const value = run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{});
     try std.testing.expectEqual(abi.TAG_UNDEFINED, value.tag);
 }
 
@@ -674,13 +822,13 @@ test "locals round trip and default to undefined" {
         .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    try std.testing.expectEqual(@as(?i64, 5), run(&set_get, &[_]abi.Value{}).asInt());
+    try std.testing.expectEqual(@as(?i64, 5), run(&set_get, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asInt());
 
     const read_default = [_]abi.Instruction{
         .{ .op = abi.OP_GET_LOCAL, .operand = 7 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    const value = run(&read_default, &[_]abi.Value{});
+    const value = run(&read_default, &[_]abi.Value{}, &[_]abi.KeelFunction{});
     try std.testing.expectEqual(abi.TAG_UNDEFINED, value.tag);
 }
 
@@ -691,7 +839,7 @@ test "dup duplicates the top of the stack" {
         .{ .op = abi.OP_ADD, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    try std.testing.expectEqual(@as(?i64, 2), run(&instructions, &[_]abi.Value{}).asInt());
+    try std.testing.expectEqual(@as(?i64, 2), run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asInt());
 }
 
 test "jumps control the program counter" {
@@ -703,7 +851,7 @@ test "jumps control the program counter" {
         .{ .op = abi.OP_LOAD_INT, .operand = 7 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    try std.testing.expectEqual(@as(?i64, 7), run(&jmp, &[_]abi.Value{}).asInt());
+    try std.testing.expectEqual(@as(?i64, 7), run(&jmp, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asInt());
 
     // Conditional jump taken on a falsy condition only.
     const branch = struct {
@@ -716,7 +864,7 @@ test "jumps control the program counter" {
                 .{ .op = abi.OP_LOAD_INT, .operand = 0 },
                 .{ .op = abi.OP_RETURN, .operand = 0 },
             };
-            try std.testing.expectEqual(@as(?i64, expected), run(&instructions, &[_]abi.Value{}).asInt());
+            try std.testing.expectEqual(@as(?i64, expected), run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{}).asInt());
         }
     }.call;
     try branch(1, 1); // truthy: falls through
@@ -736,7 +884,7 @@ test "string values round trip through run and pool" {
         .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    const value = run(&instructions, &pool);
+    const value = run(&instructions, &pool, &[_]abi.KeelFunction{});
     try std.testing.expectEqualStrings("ab", value.asString().?);
 }
 
@@ -754,7 +902,7 @@ test "add concatenates when either operand is a string" {
         .{ .op = abi.OP_ADD, .operand = 0 },
         .{ .op = abi.OP_RETURN, .operand = 0 },
     };
-    const value = run(&instructions, &pool);
+    const value = run(&instructions, &pool, &[_]abi.KeelFunction{});
     try std.testing.expectEqualStrings("a5", value.asString().?);
 }
 
@@ -762,7 +910,7 @@ test "to_string renders template substitutions" {
     // 0.5 -> "0.5"
     const load = abi.Instruction.loadF64(0.5);
     const program = [_]abi.Instruction{ load[0], load[1], .{ .op = abi.OP_TO_STRING, .operand = 0 }, .{ .op = abi.OP_RETURN, .operand = 0 } };
-    const value = run(&program, &[_]abi.Value{});
+    const value = run(&program, &[_]abi.Value{}, &[_]abi.KeelFunction{});
     try std.testing.expectEqualStrings("0.5", value.asString().?);
 }
 
@@ -781,7 +929,7 @@ test "string comparisons and equality follow js rules" {
                 .{ .op = op, .operand = 0 },
                 .{ .op = abi.OP_RETURN, .operand = 0 },
             };
-            return run(&instructions, &pool).asBool().?;
+            return run(&instructions, &pool, &[_]abi.KeelFunction{}).asBool().?;
         }
     }.call;
 
@@ -806,7 +954,7 @@ test "string truthiness and numeric coercion" {
                 .{ .op = abi.OP_NOT, .operand = 0 },
                 .{ .op = abi.OP_RETURN, .operand = 0 },
             };
-            return !run(&instructions, &pool).asBool().?;
+            return !run(&instructions, &pool, &[_]abi.KeelFunction{}).asBool().?;
         }
     }.call;
     try std.testing.expect(truthy("0")); // JS: "0" is truthy
@@ -828,11 +976,118 @@ test "string truthiness and numeric coercion" {
                 .{ .op = abi.OP_EQ, .operand = 0 },
                 .{ .op = abi.OP_RETURN, .operand = 0 },
             };
-            return run(&instructions, &pool).asBool().?;
+            return run(&instructions, &pool, &[_]abi.KeelFunction{}).asBool().?;
         }
     }.call;
     try std.testing.expect(loose("5"));
     try std.testing.expect(!loose("6"));
+}
+
+test "calls and returns through frames" {
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_CLOSURE, .operand = 1 },
+        .{ .op = abi.OP_CALL, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 5 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const functions = [_]abi.KeelFunction{
+        .{ .start = 0, .len = 3, .local_count = 0, .arity = 0 },
+        .{ .start = 3, .len = 2, .local_count = 0, .arity = 0 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &functions);
+    try std.testing.expectEqual(@as(?i64, 5), value.asInt());
+}
+
+test "arguments bind to parameters frame-relatively" {
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_CLOSURE, .operand = 1 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 2 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 3 },
+        .{ .op = abi.OP_CALL, .operand = 2 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        // function(a, b) { return a + b; }
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 1 },
+        .{ .op = abi.OP_ADD, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const functions = [_]abi.KeelFunction{
+        .{ .start = 0, .len = 5, .local_count = 0, .arity = 0 },
+        .{ .start = 5, .len = 4, .local_count = 2, .arity = 2 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &functions);
+    try std.testing.expectEqual(@as(?i64, 5), value.asInt());
+}
+
+test "closures capture cells and share mutation" {
+    // let c = 0; const inc = () => { c += 1; }; inc(); inc(); c  ->  2
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_INT, .operand = 0 },
+        .{ .op = abi.OP_SET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_MAKE_CELL, .operand = 0 },
+        .{ .op = abi.OP_CLOSURE, .operand = 1 },
+        .{ .op = abi.OP_CAPTURE_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_SET_LOCAL, .operand = 1 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 1 },
+        .{ .op = abi.OP_CALL, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 1 },
+        .{ .op = abi.OP_CALL, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        // () => { c += 1; }
+        .{ .op = abi.OP_GET_UPVALUE, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_ADD, .operand = 0 },
+        .{ .op = abi.OP_SET_UPVALUE, .operand = 0 },
+        .{ .op = abi.OP_LOAD_UNDEFINED, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const functions = [_]abi.KeelFunction{
+        .{ .start = 0, .len = 14, .local_count = 2, .arity = 0 },
+        .{ .start = 14, .len = 6, .local_count = 0, .arity = 0 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &functions);
+    try std.testing.expectEqual(@as(?i64, 2), value.asInt());
+}
+
+test "recursion works through self-capture" {
+    // function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); }
+    // fact(5) -> 120
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_UNDEFINED, .operand = 0 },
+        .{ .op = abi.OP_SET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_MAKE_CELL, .operand = 0 },
+        .{ .op = abi.OP_CLOSURE, .operand = 1 },
+        .{ .op = abi.OP_CAPTURE_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_SET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 5 },
+        .{ .op = abi.OP_CALL, .operand = 1 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_LE, .operand = 0 },
+        .{ .op = abi.OP_JMP_IF_FALSE, .operand = 16 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_GET_UPVALUE, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_SUB, .operand = 0 },
+        .{ .op = abi.OP_CALL, .operand = 1 },
+        .{ .op = abi.OP_MUL, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const functions = [_]abi.KeelFunction{
+        .{ .start = 0, .len = 10, .local_count = 1, .arity = 0 },
+        .{ .start = 10, .len = 14, .local_count = 1, .arity = 1 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &functions);
+    try std.testing.expectEqual(@as(?i64, 120), value.asInt());
 }
 
 test "formatValue matches js string conversion" {

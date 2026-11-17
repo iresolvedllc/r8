@@ -78,6 +78,15 @@ fn main() {
                 ("let x = 1; { let x = 2; } x", "1"),
                 ("0 && 5", "0"),
                 ("0 || 7", "7"),
+                ("function add(a, b) { return a + b; } add(20, 22)", "42"),
+                (
+                    "let c = 0; const inc = () => { c += 1; }; inc(); inc(); c",
+                    "2",
+                ),
+                (
+                    "function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); } fact(5)",
+                    "120",
+                ),
             ] {
                 check_program(&mut failures, source, expected);
             }

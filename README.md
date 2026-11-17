@@ -12,15 +12,15 @@ tier) without porting any of its code.
 
 ## Status
 
-Phase 3: strings. On top of the full expression language and statements
-(`let`/`const`/`var`, assignment, blocks, `if`/`else`, `while`, `for`,
-`&&`/`||`), R8 now has **string values**: quoted literals with escapes,
-template literals with nested substitutions, `+` concatenation with JS
-coercion rules, string comparisons and equality, and truthiness/numeric
-coercion. Strings live in a constant pool on the Rust side and in a
-machine-owned arena on the Zig side.
+Phase 4: functions. R8 now has the full statement and expression language
+plus **functions and closures**: `function` declarations, anonymous function
+expressions, arrow functions (including paren-free single parameters),
+`return`, calls (first-class function values, currying, higher-order
+functions), and JS-correct closure semantics — captured variables are
+heap-allocated cells, so mutations are shared and closures outlive their
+frames (counters, recursion through self-capture).
 
-Not yet: functions, objects/arrays (see the roadmap).
+Not yet: objects/arrays (see the roadmap).
 
 ## Usage
 
@@ -30,6 +30,7 @@ cargo run -p r8-cli -- eval "0.1 + 0.2"      # 0.30000000000000004
 cargo run -p r8-cli -- eval "1 / 0"          # Infinity
 cargo run -p r8-cli -- eval "'a' + 5"        # a5
 cargo run -p r8-cli -- eval "`x${1 + 1}y`"   # x2y
+cargo run -p r8-cli -- eval "((f, x) => f(f(x)))((v) => v * v, 3)"  # 81
 cargo run -p r8-cli -- run tests/smoke/strings.js
 cargo run -p r8-cli -- selftest              # runtime ABI + eval smoke test
 ```
@@ -81,21 +82,34 @@ zig test zig/src/root.zig
 - **`console.log` is an intrinsic.** It compiles to `OP_PRINT` and is
   implemented inside the machine. It will be replaced by a proper host
   function mechanism (via `r8-core` host hooks) once calls exist.
+- **Functions compile per-body and concatenate.** Each function body gets
+  its own instruction buffer; completed buffers concatenate into the flat
+  stream (innermost first, main last) and the machine starts at
+  `functions[0].start`. A call frame owns a region of the flat locals array
+  plus its own operand-stack base, so recursion nests naturally.
+- **Closures are correct via cells.** A syntactic, shadowing-aware prescan
+  decides which locals any nested function captures; those bindings are
+  moved into heap cells (`OP_MAKE_CELL`) that live in the machine's arena,
+  so closures share mutation and outlive their frames. Upvalue chains are
+  built transitively at reference resolution; recursion works because a
+  function's own cell exists before its closure is created (self-capture).
 - **Strings cross the FFI as pointers.** `TAG_STRING`'s payload points at a
   `KeelString {ptr, len}`. String *constants* are interned into a Rust-side
-  pool passed to `r8_machine_run(code, len, pool, pool_len)`; the machine
-  copies pool bytes into its own arena when a constant is loaded, so the
-  pool only needs to outlive the call. Runtime strings (concatenations,
-  template substitutions) are allocated in the machine's arena, which
-  resets at the start of every run — returned string values are valid until
-  the next run. Both are documented leaks until the GC (Phase 6). Because
-  the machine holds global state, runs are serialized by a spinlock.
+  pool passed to `r8_machine_run(code, len, pool, pool_len, functions,
+  fn_len)`; the machine copies pool bytes into its own arena when a
+  constant is loaded, so the pool only needs to outlive the call. Runtime
+  strings (concatenations, template substitutions) are allocated in the
+  machine's arena, which resets at the start of every run — returned string
+  values are valid until the next run. Both are documented leaks until the
+  GC (Phase 6). Because the machine holds global state, runs are serialized
+  by a spinlock.
 - **Jumps and locals.** `if`/`else`/`while`/`for` compile to absolute-index
   jumps (`OP_JMP`, `OP_JMP_IF_FALSE`, `OP_JMP_IF_TRUE`) whose targets are
-  patched once known; `&&`/`||` use `OP_DUP` plus conditional jumps so the
-  deciding operand stays on the stack. Every declaration owns a distinct
-  local slot, which makes block shadowing free at runtime; `let x = x` is
-  rejected at compile time (a TDZ approximation until full TDZ checks land).
+  patched once known (and rebased when buffers concatenate); `&&`/`||` use
+  `OP_DUP` plus conditional jumps so the deciding operand stays on the
+  stack. Every declaration owns a distinct local slot, which makes block
+  shadowing free at runtime; `let x = x` is rejected at compile time (a TDZ
+  approximation until full TDZ checks land).
 
 ## Roadmap
 
@@ -104,7 +118,7 @@ zig test zig/src/root.zig
 | 1 ✅ | expression language + doubles | `tests/smoke/arith.js` |
 | 2 ✅ | variables, assignment, control flow, `&&`/`\|\|` | — |
 | 3 ✅ | strings, template literals, string semantics | `tests/smoke/strings.js` |
-| 4 | functions, calls, closures | — |
+| 4 ✅ | functions, calls, closures | — |
 | 5 | arrays, objects, property access | `tests/smoke/array.js` |
 | 6 | isolate/allocator wiring, GC, baseline tier, IR | — |
 

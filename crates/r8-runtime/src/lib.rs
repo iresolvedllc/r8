@@ -33,14 +33,17 @@ pub fn eval_program(source: &str) -> Result<Value, EvalError> {
 }
 
 fn run_machine(compiled: &Compiled) -> Result<Value, EvalError> {
-    // SAFETY: the bytecode and pool are a valid instruction stream and
-    // constant pool for the machine; both outlive the call.
+    // SAFETY: the bytecode, pool, and function table are a valid instruction
+    // stream, constant pool, and function table for the machine; all three
+    // outlive the call.
     let value = unsafe {
         r8_abi::r8_machine_run(
             compiled.instructions.as_ptr(),
             compiled.instructions.len(),
             compiled.pool.as_ptr(),
             compiled.pool.len(),
+            compiled.functions.as_ptr(),
+            compiled.functions.len(),
         )
     };
     Ok(value)
@@ -191,6 +194,132 @@ mod tests {
                 .to_string(),
             "hello r8"
         );
+    }
+
+    #[test]
+    fn evaluates_functions_and_calls() {
+        assert_eq!(
+            eval_program("function add(a, b) { return a + b; } add(2, 3)")
+                .unwrap()
+                .to_string(),
+            "5"
+        );
+        // Arrows as values.
+        assert_eq!(
+            eval_program("const double = (x) => x * 2; double(21)")
+                .unwrap()
+                .to_string(),
+            "42"
+        );
+        assert_eq!(
+            eval_program("const inc = (x) => x + 1; inc(inc(inc(0)))")
+                .unwrap()
+                .to_string(),
+            "3"
+        );
+        // Immediately invoked arrow expression.
+        assert_eq!(eval("(() => 42)()").unwrap().to_string(), "42");
+        // Anonymous function expression.
+        assert_eq!(
+            eval("(function (x) { return x; })(9)").unwrap().to_string(),
+            "9"
+        );
+        // A call result can be called: two-level currying.
+        assert_eq!(
+            eval_program("const adder = (n) => (m) => n + m; adder(3)(4)")
+                .unwrap()
+                .to_string(),
+            "7"
+        );
+    }
+
+    #[test]
+    fn evaluates_closures() {
+        // Captured variables share mutation.
+        assert_eq!(
+            eval_program("let c = 0; const inc = () => { c += 1; }; inc(); inc(); c")
+                .unwrap()
+                .to_string(),
+            "2"
+        );
+        // Cells outlive their frame: counter keeps incrementing after
+        // `counter` returned.
+        assert_eq!(
+            eval_program(
+                "function counter() { let n = 0; return () => { n += 1; return n; }; } \
+                 const c = counter(); c(); c(); c()"
+            )
+            .unwrap()
+            .to_string(),
+            "3"
+        );
+        // Separate closures get separate cells.
+        assert_eq!(
+            eval_program(
+                "function counter() { let n = 0; return () => { n += 1; return n; }; } \
+                 const a = counter(); const b = counter(); a(); a(); b()"
+            )
+            .unwrap()
+            .to_string(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn evaluates_recursion_and_higher_order() {
+        assert_eq!(
+            eval_program(
+                "function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); } fact(5)"
+            )
+            .unwrap()
+            .to_string(),
+            "120"
+        );
+        assert_eq!(
+            eval_program(
+                "function fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fib(10)"
+            )
+            .unwrap()
+            .to_string(),
+            "55"
+        );
+        assert_eq!(
+            eval_program("function twice(f, x) { return f(f(x)); } twice((v) => v + 1, 5)")
+                .unwrap()
+                .to_string(),
+            "7"
+        );
+    }
+
+    #[test]
+    fn follows_js_call_semantics() {
+        // Missing arguments read as undefined; extras are ignored.
+        assert_eq!(
+            eval_program("function g(a, b) { return b; } g(1)")
+                .unwrap()
+                .to_string(),
+            "undefined"
+        );
+        assert_eq!(
+            eval_program("function g(a) { return a; } g(1, 2, 3)")
+                .unwrap()
+                .to_string(),
+            "1"
+        );
+        // `return;` yields undefined.
+        assert_eq!(
+            eval_program("function f() { return; } f()")
+                .unwrap()
+                .to_string(),
+            "undefined"
+        );
+        // Falling off the end yields undefined.
+        assert_eq!(
+            eval_program("function f() { 1; } f()").unwrap().to_string(),
+            "undefined"
+        );
+        // Functions print like Node's `[Function (anonymous)]`.
+        assert_eq!(eval("() => 1").unwrap().to_string(), "[function]");
     }
 
     #[test]
