@@ -3,11 +3,11 @@
 //! strings (TAG_STRING, constant pool, LOAD_STRING/TO_STRING); ABI v5 adds
 //! functions (TAG_FUNCTION, function table, closure/capture opcodes); ABI v6
 //! adds arrays and objects (TAG_ARRAY, TAG_OBJECT, TAG_METHOD, property
-//! access).
+//! access); ABI v7 adds exceptions (TRY_ENTER/TRY_EXIT/THROW, err_out).
 
 const std = @import("std");
 
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 /// Value tags. Mirrors `crates/r8-abi`'s constants; the `CONFORMANCE_TAGS`
 /// table below lists them in the same canonical order — keep both in sync.
@@ -112,6 +112,16 @@ pub const OP_GET_INDEX: u32 = 42;
 /// lets plain and compound shapes align). Pushes the assigned value as the
 /// expression's result.
 pub const OP_SET_INDEX: u32 = 43;
+/// Pushes an exception handler frame: on a throw within this frame, the
+/// machine restores the try-entry stack depth and jumps to catch pc
+/// `operand`, pushing the caught value.
+pub const OP_TRY_ENTER: u32 = 44;
+/// Pops the innermost exception handler (end of a try block).
+pub const OP_TRY_EXIT: u32 = 45;
+/// Pops the thrown value and unwinds: to the nearest handler in this frame
+/// (restoring the try-entry state and pushing the caught value), or — after
+/// unwinding call frames — out of the program through `err_out`.
+pub const OP_THROW: u32 = 46;
 
 /// Canonical tag order mirrored from `crates/r8-abi`'s `CONFORMANCE_TAGS`.
 const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED, TAG_STRING, TAG_FUNCTION, TAG_ARRAY, TAG_METHOD };
@@ -163,6 +173,9 @@ const CONFORMANCE_OPS = [_]u32{
     OP_NEW_OBJECT,
     OP_GET_INDEX,
     OP_SET_INDEX,
+    OP_TRY_ENTER,
+    OP_TRY_EXIT,
+    OP_THROW,
 };
 
 pub const Value = extern struct {
@@ -306,7 +319,7 @@ comptime {
     if (@alignOf(Value) != 8) @compileError("Value must align to 8");
     if (@sizeOf(Instruction) != 8) @compileError("Instruction must be 8 bytes");
     if (CONFORMANCE_TAGS.len != 10) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
-    if (CONFORMANCE_OPS.len != 44) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
+    if (CONFORMANCE_OPS.len != 47) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
 }
 
 pub export fn r8_abi_version() u32 {

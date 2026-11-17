@@ -35,3 +35,26 @@ jobs:
 
       - name: smoke fixture (arith.js)
         run: cargo run -p r8-cli -- run tests/smoke/arith.js
+
+      - name: test262 gates
+        run: |
+          bash scripts/fetch-corpus.sh
+          cargo run -q -p r8-test262 -- \
+            --engine target/debug/r8 \
+            --jobs 8 \
+            --gate conformance/gates.txt \
+            --suite language/types \
+            --suite language/literals \
+            --suite language/identifiers \
+            --suite language/asi \
+            --suite language/comments \
+            --suite language/white-space \
+            --suite language/punctuators \
+            --suite language/directive-prologue \
+            --suite language/reserved-words \
+            --suite language/keywords \
+            --suite language/future-reserved-words \
+            --suite language/line-terminators \
+            --suite language/source-text \
+            --suite language/statementList \
+            --suite language/block-scope

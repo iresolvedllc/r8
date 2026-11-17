@@ -192,6 +192,13 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     Return(Option<Expr>),
+    Try {
+        body: Vec<Stmt>,
+        /// The `catch (binding)` name; `None` for `catch { }`.
+        catch_binding: Option<String>,
+        catch_body: Vec<Stmt>,
+    },
+    Throw(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,6 +255,10 @@ pub enum Token {
     For,
     Function,
     Return,
+    Try,
+    Catch,
+    Finally,
+    Throw,
     True,
     False,
     Null,
@@ -269,6 +280,8 @@ pub enum ParseError {
     TrailingInput,
     #[error("unterminated string literal")]
     UnterminatedString,
+    #[error("unterminated block comment")]
+    UnterminatedComment,
     #[error("invalid escape sequence")]
     InvalidEscape,
     #[error("{0} are not supported yet")]
@@ -564,11 +577,26 @@ impl Lexer<'_> {
                 }
             }
             '/' => {
-                // `//` starts a line comment; otherwise it is division.
+                // `//` starts a line comment; `/*` a block comment; otherwise
+                // it is division.
                 if self.characters.get(self.index + 1) == Some(&'/') {
                     while self.index < self.characters.len() && self.characters[self.index] != '\n'
                     {
                         self.index += 1;
+                    }
+                } else if self.characters.get(self.index + 1) == Some(&'*') {
+                    // Block comments do not nest. Unterminated ones are an
+                    // early syntax error.
+                    self.index += 2;
+                    loop {
+                        match self.characters.get(self.index) {
+                            None => return Err(ParseError::UnterminatedComment),
+                            Some('*') if self.characters.get(self.index + 1) == Some(&'/') => {
+                                self.index += 2;
+                                break;
+                            }
+                            _ => self.index += 1,
+                        }
                     }
                 } else if self.characters.get(self.index + 1) == Some(&'=') {
                     self.tokens.push(Token::SlashEq);
@@ -719,6 +747,10 @@ impl Lexer<'_> {
                     "for" => Token::For,
                     "function" => Token::Function,
                     "return" => Token::Return,
+                    "try" => Token::Try,
+                    "catch" => Token::Catch,
+                    "finally" => Token::Finally,
+                    "throw" => Token::Throw,
                     "true" => Token::True,
                     "false" => Token::False,
                     "null" => Token::Null,
@@ -1316,6 +1348,8 @@ impl Parser {
             Token::For => self.for_statement(),
             Token::Function => self.function_declaration(),
             Token::Return => self.return_statement(),
+            Token::Try => self.try_statement(),
+            Token::Throw => self.throw_statement(),
             Token::LeftBrace => {
                 self.next();
                 Ok(Stmt::Block(self.block_body()?))
@@ -1442,6 +1476,43 @@ impl Parser {
             statements.push(self.statement()?);
         }
         Ok(statements)
+    }
+
+    fn try_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.next(); // `try`
+        self.expect(&Token::LeftBrace)?;
+        let body = self.block_body()?;
+        if self.peek() != &Token::Catch {
+            return Err(ParseError::Unsupported("finally blocks"));
+        }
+        self.next(); // `catch`
+        let catch_binding = if self.peek() == &Token::LParen {
+            self.index += 1;
+            let binding = match self.next() {
+                Token::Identifier(name) => name,
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                _ => return Err(ParseError::ExpectedIdentifier),
+            };
+            self.expect(&Token::RParen)?;
+            Some(binding)
+        } else {
+            None
+        };
+        self.expect(&Token::LeftBrace)?;
+        let catch_body = self.block_body()?;
+        Ok(Stmt::Try {
+            body,
+            catch_binding,
+            catch_body,
+        })
+    }
+
+    fn throw_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.next(); // `throw`
+        // A bare `throw;` is a SyntaxError in JS as well.
+        let expression = self.expression()?;
+        self.end_statement()?;
+        Ok(Stmt::Throw(expression))
     }
 
     fn if_statement(&mut self) -> Result<Stmt, ParseError> {
@@ -1636,6 +1707,7 @@ impl Compiler {
                 if instruction.op == r8_abi::OP_JMP
                     || instruction.op == r8_abi::OP_JMP_IF_FALSE
                     || instruction.op == r8_abi::OP_JMP_IF_TRUE
+                    || instruction.op == r8_abi::OP_TRY_ENTER
                 {
                     instruction.operand += start as i32;
                 }
@@ -1805,8 +1877,11 @@ impl Compiler {
                 self.emit(Instruction::return_());
             }
             None => {
-                let last_keeps_value =
-                    wants_last_value && matches!(body.last(), Some(Stmt::Expression(_)));
+                let last_keeps_value = wants_last_value
+                    && matches!(
+                        body.last(),
+                        Some(Stmt::Expression(_)) | Some(Stmt::Try { .. })
+                    );
                 for (i, statement) in body.iter().enumerate() {
                     let wants_value = last_keeps_value && i + 1 == body.len();
                     self.statement(statement, wants_value)?;
@@ -1924,6 +1999,18 @@ impl Compiler {
             }
             Stmt::Return(Some(expression)) => Self::walk_expr(expression, bound, captured, free),
             Stmt::Return(None) => {}
+            Stmt::Try {
+                body,
+                catch_binding,
+                catch_body,
+            } => {
+                Self::walk_statements(body, bound, captured, free);
+                if let Some(init) = catch_binding {
+                    bound.insert(init.clone());
+                }
+                Self::walk_statements(catch_body, bound, captured, free);
+            }
+            Stmt::Throw(expression) => Self::walk_expr(expression, bound, captured, free),
         }
     }
 
@@ -2535,6 +2622,58 @@ impl Compiler {
             Stmt::Return(None) => {
                 self.emit(Instruction::load_undefined());
                 self.emit(Instruction::return_());
+            }
+            Stmt::Try {
+                body,
+                catch_binding,
+                catch_body,
+            } => {
+                let try_enter = self.emit(Instruction::try_enter(0));
+                // Whichever path runs (try or catch), its final expression
+                // carries the block's completion value when one is wanted.
+                for (index, statement) in body.iter().enumerate() {
+                    let wants = wants_value && index + 1 == body.len();
+                    self.statement(statement, wants)?;
+                }
+                self.emit(Instruction::try_exit());
+                let jump_end = self.emit(Instruction::jmp(0));
+                // The catch pc: the machine restores the try-entry stack and
+                // pushes the caught value onto it.
+                let catch_pc = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch(try_enter, catch_pc);
+                self.scopes.push(Scope {
+                    bindings: HashMap::new(),
+                });
+                match catch_binding {
+                    Some(binding) => {
+                        let slot = self.declare(binding, false)?;
+                        self.emit(Instruction::set_local(slot));
+                    }
+                    None => {
+                        self.emit(Instruction::pop());
+                    }
+                }
+                for (index, statement) in catch_body.iter().enumerate() {
+                    let wants = wants_value && index + 1 == catch_body.len();
+                    self.statement(statement, wants)?;
+                }
+                self.scopes.pop();
+                let end = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch(jump_end, end);
+            }
+            Stmt::Throw(expression) => {
+                self.expression(expression)?;
+                self.emit(Instruction::throw());
             }
         }
         Ok(())

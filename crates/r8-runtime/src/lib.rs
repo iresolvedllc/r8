@@ -12,6 +12,8 @@ pub enum EvalError {
     Parse(#[from] ParseError),
     #[error("compile error: {0}")]
     Compile(#[from] CompileError),
+    #[error("uncaught {0}")]
+    Uncaught(Value),
     #[error("result is not an integer")]
     NotAnInteger,
 }
@@ -36,6 +38,7 @@ fn run_machine(compiled: &Compiled) -> Result<Value, EvalError> {
     // SAFETY: the bytecode, pool, and function table are a valid instruction
     // stream, constant pool, and function table for the machine; all three
     // outlive the call.
+    let mut err = Value::UNDEFINED;
     let value = unsafe {
         r8_abi::r8_machine_run(
             compiled.instructions.as_ptr(),
@@ -44,8 +47,12 @@ fn run_machine(compiled: &Compiled) -> Result<Value, EvalError> {
             compiled.pool.len(),
             compiled.functions.as_ptr(),
             compiled.functions.len(),
+            &mut err,
         )
     };
+    if err.tag != r8_abi::TAG_UNDEFINED {
+        return Err(EvalError::Uncaught(err));
+    }
     Ok(value)
 }
 
@@ -358,6 +365,80 @@ mod tests {
             let actual = unsafe { r8_abi::r8_abi_op_at(index) };
             assert_eq!(actual, *expected, "opcode constant {index} drifted");
         }
+    }
+}
+
+#[cfg(test)]
+mod exception_tests {
+    use super::*;
+
+    #[test]
+    fn evaluates_exceptions() {
+        // try/catch with a binding.
+        assert_eq!(
+            eval_program("try { throw 7; } catch (e) { e }")
+                .unwrap()
+                .to_string(),
+            "7"
+        );
+        // Thrown values from deep frames are caught outside.
+        assert_eq!(
+            eval_program(
+                "function boom() { throw 'x'; } \
+                 let out = ''; \
+                 try { boom(); out = 'no'; } catch (e) { out = e; } out"
+            )
+            .unwrap()
+            .to_string(),
+            "x"
+        );
+        // Runtime member-access errors are throws, not crashes.
+        assert_eq!(
+            eval_program("try { undefined.x; } catch (e) { 1; }")
+                .unwrap()
+                .to_string(),
+            "1"
+        );
+        // Calling a non-function throws too.
+        assert_eq!(
+            eval_program("let n = 5; try { n(); } catch (e) { 2; }")
+                .unwrap()
+                .to_string(),
+            "2"
+        );
+        // A callback throw aborts map and lands in the outer catch.
+        assert_eq!(
+            eval_program("try { [1].map(() => { throw 'cb'; }); } catch (e) { e }")
+                .unwrap()
+                .to_string(),
+            "cb"
+        );
+        // catch without a binding.
+        assert_eq!(
+            eval_program("try { throw 1; } catch { 9; }")
+                .unwrap()
+                .to_string(),
+            "9"
+        );
+        // Nested try: the inner catch rethrows, the outer handles it.
+        assert_eq!(
+            eval_program(
+                "try { try { throw 'inner'; } catch (e) { throw 'outer'; } } \
+                 catch (e) { e }"
+            )
+            .unwrap()
+            .to_string(),
+            "outer"
+        );
+        // Uncaught throws surface as errors.
+        assert!(eval_program("throw 'boom';").is_err());
+        // finally is not supported yet.
+        assert!(matches!(
+            eval_program("try { 1; } finally { 2; }"),
+            Err(EvalError::Parse(r8_front::ParseError::Unsupported(
+                "finally blocks"
+            )))
+        ));
     }
 }
 

@@ -25,8 +25,13 @@
 //! element/property storage), `TAG_METHOD` (a bound builtin: receiver +
 //! method id), array/object construction, and unified property access
 //! (`a.b` compiles to `a["b"]`) with JS GetV semantics.
+//!
+//! ABI v7 adds exceptions: `OP_TRY_ENTER` / `OP_TRY_EXIT` manage a handler
+//! stack (catch pc, stack depth, frame), `OP_THROW` unwinds to the nearest
+//! handler or out of the program, and `r8_machine_run` gains an `err_out`
+//! parameter that receives the uncaught thrown value (or `undefined`).
 
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 /// Value tags. `CONFORMANCE_TAGS` lists these in a canonical order; keep both
 /// in sync with `zig/src/abi.zig`.
@@ -131,6 +136,16 @@ pub const OP_GET_INDEX: u32 = 42;
 /// lets plain and compound shapes align). Pushes the assigned value as the
 /// expression's result.
 pub const OP_SET_INDEX: u32 = 43;
+/// Pushes an exception handler frame: on a throw within this frame, the
+/// machine restores the try-entry stack depth and jumps to catch pc
+/// `operand`, pushing the caught value.
+pub const OP_TRY_ENTER: u32 = 44;
+/// Pops the innermost exception handler (end of a try block).
+pub const OP_TRY_EXIT: u32 = 45;
+/// Pops the thrown value and unwinds: to the nearest handler in this frame
+/// (restoring the try-entry state and pushing the caught value), or — after
+/// unwinding call frames — out of the program through `err_out`.
+pub const OP_THROW: u32 = 46;
 
 /// Canonical tag order mirrored by `zig/src/abi.zig` for conformance probes.
 /// New tags are appended at the end so existing indices stay stable.
@@ -194,6 +209,9 @@ pub const CONFORMANCE_OPS: &[u32] = &[
     OP_NEW_OBJECT,
     OP_GET_INDEX,
     OP_SET_INDEX,
+    OP_TRY_ENTER,
+    OP_TRY_EXIT,
+    OP_THROW,
 ];
 
 #[repr(C)]
@@ -596,6 +614,27 @@ impl Instruction {
         }
     }
 
+    pub const fn try_enter(catch_pc: usize) -> Self {
+        Self {
+            op: OP_TRY_ENTER,
+            operand: catch_pc as i32,
+        }
+    }
+
+    pub const fn try_exit() -> Self {
+        Self {
+            op: OP_TRY_EXIT,
+            operand: 0,
+        }
+    }
+
+    pub const fn throw() -> Self {
+        Self {
+            op: OP_THROW,
+            operand: 0,
+        }
+    }
+
     pub const fn print() -> Self {
         Self {
             op: OP_PRINT,
@@ -681,6 +720,10 @@ unsafe extern "C" {
         pool_len: usize,
         functions: *const KeelFunction,
         functions_len: usize,
+        // Receives the uncaught thrown value on failure, or `undefined` on
+        // success. Thrown values point into the machine's arena (valid
+        // until the next run).
+        err_out: *mut Value,
     ) -> Value;
 
     /// Conformance probes exported by `zig/src/abi.zig`: the Zig machine
@@ -847,6 +890,9 @@ mod tests {
             OP_NEW_OBJECT,
             OP_GET_INDEX,
             OP_SET_INDEX,
+            OP_TRY_ENTER,
+            OP_TRY_EXIT,
+            OP_THROW,
         ];
         for op in ops {
             assert!(

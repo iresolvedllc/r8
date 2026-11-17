@@ -1,0 +1,41 @@
+name: conformance
+
+on:
+  schedule:
+    # Nightly at 03:20 UTC.
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  test262:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      - name: build
+        run: cargo build -p r8-cli -p r8-test262
+
+      - name: fetch corpora
+        run: bash scripts/fetch-corpus.sh
+
+      - name: full test262 run
+        run: |
+          cargo run -q -p r8-test262 -- \
+            --engine target/debug/r8 \
+            --jobs 8 \
+            --gate conformance/gates.txt \
+            --report conformance-results
+
+      - name: upload scoreboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-results
+          path: |
+            conformance-results/test262-results.json
+            conformance-results/test262-summary.md

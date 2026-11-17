@@ -8,6 +8,7 @@ members = [
   "crates/r8-front",
   "crates/r8-ir",
   "crates/r8-runtime",
+  "crates/r8-test262",
 ]
 
 [workspace.package]

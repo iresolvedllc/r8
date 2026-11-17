@@ -1,0 +1,21 @@
+# Test262 conformance gates: minimum pass rates per suite prefix.
+# Rates are over runnable tests (unsupported/skipped tests excluded).
+# Set at the measured baseline when this file was created; raise them as the
+# engine grows, and never lower them.
+# Format: <suite-prefix> <min-pass-rate-percent>
+
+language/types 18
+language/literals 61
+language/identifiers 45
+language/asi 50
+language/comments 66
+language/white-space 16
+language/punctuators 90
+language/directive-prologue 29
+language/reserved-words 53
+language/keywords 100
+language/future-reserved-words 87
+language/line-terminators 73
+language/source-text 0
+language/statementList 15
+language/block-scope 85

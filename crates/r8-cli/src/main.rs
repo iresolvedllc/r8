@@ -14,9 +14,12 @@ enum Command {
     Eval {
         source: String,
     },
-    /// Execute a file as a program of expression statements.
+    /// Execute a file as a program of expression statements. Harness files
+    /// are prepended (test262-style: harnesses share the global scope).
     Run {
         path: PathBuf,
+        #[arg(long = "harness")]
+        harness: Vec<PathBuf>,
     },
     Selftest,
     Version,
@@ -32,15 +35,18 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Command::Run { path } => {
-            let source = match std::fs::read_to_string(&path) {
-                Ok(source) => source,
-                Err(error) => {
-                    eprintln!("r8: cannot read {}: {error}", path.display());
-                    std::process::exit(1);
+        Command::Run { path, harness } => {
+            let mut sources = Vec::new();
+            for file in harness.iter().chain(std::iter::once(&path)) {
+                match std::fs::read_to_string(file) {
+                    Ok(source) => sources.push(source),
+                    Err(error) => {
+                        eprintln!("r8: cannot read {}: {error}", file.display());
+                        std::process::exit(1);
+                    }
                 }
-            };
-            match r8_api::eval_program(&source) {
+            }
+            match r8_api::eval_program(&sources.join("\n")) {
                 // Statement side effects (console.log) have already printed.
                 Ok(_) => {}
                 Err(error) => {

@@ -92,6 +92,7 @@ const Builtin = enum(u32) {
 const LOCAL_CAPACITY = 512;
 const MAX_FRAMES = 64;
 const MAX_ARGS = 32;
+const MAX_HANDLERS = 64;
 
 const Cell = struct {
     value: abi.Value,
@@ -109,6 +110,14 @@ const Frame = struct {
     /// The running function's object (holds its upvalue cells); null for
     /// the main frame.
     function: ?*FunctionObject,
+};
+
+/// An active try block: where to catch, and the state to restore.
+const Handler = struct {
+    catch_pc: usize,
+    sp: usize,
+    fp: usize,
+    locals_top: usize,
 };
 
 const Stack = struct {
@@ -156,9 +165,18 @@ pub const Machine = struct {
     locals: [LOCAL_CAPACITY]abi.Value = undefined,
     cells: [LOCAL_CAPACITY]?*Cell = undefined,
     frames: [MAX_FRAMES]Frame = undefined,
+    handlers: [MAX_HANDLERS]Handler = undefined,
     fp: usize = 0,
+    hp: usize = 0,
     locals_top: usize = 0,
     pc: usize = 0,
+    /// Set when the program ended via an uncaught throw.
+    thrown: bool = false,
+    /// The uncaught thrown value (valid alongside `thrown`).
+    pending_throw: ?abi.Value = null,
+    /// Set when a throw crossed call frames, aborting in-flight builtin
+    /// loops; reset by `invoke`.
+    escaped: bool = false,
     code: []const abi.Instruction,
     pool: []const abi.Value,
     functions: []const abi.KeelFunction,
@@ -208,8 +226,58 @@ pub const Machine = struct {
         return self.stack.top();
     }
 
+    /// Unwinds a thrown value: to the nearest handler in the current frame,
+    /// or — popping call frames along the way — out of the program. Returns
+    /// false when nothing catches it.
+    fn unwind(self: *Machine, thrown: abi.Value) bool {
+        while (true) {
+            if (self.hp > 0) {
+                const handler = self.handlers[self.hp - 1];
+                if (handler.fp == self.fp) {
+                    self.hp -= 1;
+                    self.stack.sp = handler.sp;
+                    self.locals_top = handler.locals_top;
+                    self.pc = handler.catch_pc;
+                    self.stack.push(thrown);
+                    return true;
+                }
+                if (handler.fp > self.fp) {
+                    // A stale handler from an already-unwound frame.
+                    self.hp -= 1;
+                    continue;
+                }
+                // handler.fp < self.fp: the handler belongs to an enclosing
+                // frame — pop the current frame first.
+            }
+            if (self.fp <= 1) return false; // nothing left: uncaught at top
+            const frame = self.frames[self.fp - 1];
+            self.fp -= 1;
+            self.stack.sp = frame.stack_base;
+            self.locals_top = frame.locals_base;
+        }
+    }
+
+    /// Throws a value: either lands in a handler (execution continues at the
+    /// catch pc) or escapes the program. Returns the pending program-result
+    /// value when uncaught, else null. Sets `escaped` when the throw crossed
+    /// call frames, so in-flight builtin loops (e.g. `map`) know to abort.
+    fn throwValue(self: *Machine, thrown: abi.Value) ?abi.Value {
+        const origin_fp = self.fp;
+        if (self.unwind(thrown)) {
+            if (self.fp < origin_fp) self.escaped = true;
+            return null;
+        }
+        self.pending_throw = thrown;
+        self.thrown = true;
+        return thrown;
+    }
+
+    fn throwMessage(self: *Machine, message: []const u8) ?abi.Value {
+        return self.throwValue(allocString(message));
+    }
+
     /// Executes a single instruction; returns the program result when the
-    /// main frame returns, else null.
+    /// main frame returns or an uncaught throw escapes, else null.
     fn step(self: *Machine) ?abi.Value {
         const instruction = self.code[self.pc];
         self.pc += 1;
@@ -388,7 +456,15 @@ pub const Machine = struct {
             abi.OP_GET_INDEX => {
                 const key = self.stack.pop();
                 const receiver = self.stack.pop();
-                self.stack.push(getIndex(receiver, key));
+                if (receiver.tag == abi.TAG_NULL or receiver.tag == abi.TAG_UNDEFINED) {
+                    const message = switch (receiver.tag) {
+                        abi.TAG_NULL => "TypeError: Cannot read properties of null",
+                        else => "TypeError: Cannot read properties of undefined",
+                    };
+                    if (self.throwMessage(message)) |result| return result;
+                } else {
+                    self.stack.push(getIndex(receiver, key));
+                }
             },
             abi.OP_SET_INDEX => {
                 // Pops the key (top) and the value; the receiver stays
@@ -399,8 +475,16 @@ pub const Machine = struct {
                 const key = self.stack.pop();
                 const value = self.stack.pop();
                 const receiver = self.stack.top();
-                setIndex(receiver, key, value);
-                self.stack.push(value);
+                if (receiver.tag == abi.TAG_NULL or receiver.tag == abi.TAG_UNDEFINED) {
+                    const message = switch (receiver.tag) {
+                        abi.TAG_NULL => "TypeError: Cannot set properties of null",
+                        else => "TypeError: Cannot set properties of undefined",
+                    };
+                    if (self.throwMessage(message)) |result| return result;
+                } else {
+                    setIndex(receiver, key, value);
+                    self.stack.push(value);
+                }
             },
 
             abi.OP_CALL => {
@@ -415,7 +499,16 @@ pub const Machine = struct {
                 if (fn_value.tag == abi.TAG_METHOD) {
                     const method: *abi.KeelMethod =
                         @ptrFromInt(@as(usize, @bitCast(fn_value.payload)));
-                    self.stack.push(callBuiltin(self, method, args[0..arg_count]));
+                    if (self.callBuiltin(method, args[0..arg_count])) |result| {
+                        self.stack.push(result);
+                    }
+                    if (self.pending_throw) |thrown| return thrown;
+                    return null;
+                }
+                if (fn_value.tag != abi.TAG_FUNCTION) {
+                    if (self.throwMessage("TypeError: not a function")) |result| {
+                        return result;
+                    }
                     return null;
                 }
                 self.stack.push(fn_value);
@@ -432,9 +525,32 @@ pub const Machine = struct {
                 self.fp -= 1;
                 self.stack.sp = frame.stack_base;
                 self.locals_top = frame.locals_base;
+                // Discard any handlers the returning frame left active (a
+                // `return` from inside a try block skips TRY_EXIT).
+                while (self.hp > 0 and self.handlers[self.hp - 1].fp == self.fp + 1) {
+                    self.hp -= 1;
+                }
                 if (self.fp == 0) return value; // returned from the main frame
                 self.pc = frame.return_pc;
                 self.stack.push(value);
+            },
+            abi.OP_TRY_ENTER => {
+                if (self.hp >= MAX_HANDLERS) @panic("too many nested try blocks");
+                self.handlers[self.hp] = .{
+                    .catch_pc = jumpTarget(instruction.operand),
+                    .sp = self.stack.sp,
+                    .fp = self.fp,
+                    .locals_top = self.locals_top,
+                };
+                self.hp += 1;
+            },
+            abi.OP_TRY_EXIT => {
+                if (self.hp == 0) @panic("try exit without try enter");
+                self.hp -= 1;
+            },
+            abi.OP_THROW => {
+                const thrown = self.stack.pop();
+                if (self.throwValue(thrown)) |result| return result;
             },
             else => @panic("unknown opcode"),
         }
@@ -471,16 +587,21 @@ pub const Machine = struct {
     }
 
     /// Calls a function value with explicit arguments and returns its
-    /// result. Used by builtins (`.map`) to run interpreted callbacks on
-    /// this machine.
-    fn invoke(self: *Machine, callee: abi.Value, args: []const abi.Value) abi.Value {
+    /// result, or null when the call escaped via a throw that a handler
+    /// outside this call caught (execution continues at that catch pc) or
+    /// that escaped the program entirely (`pending_throw`/`thrown` set).
+    /// Used by builtins (`.map`) to run interpreted callbacks on this
+    /// machine.
+    fn invoke(self: *Machine, callee: abi.Value, args: []const abi.Value) ?abi.Value {
         const target_fp = self.fp;
+        self.escaped = false;
         self.stack.push(callee);
         for (args) |arg| self.stack.push(arg);
         self.performCall(args.len);
         while (self.fp > target_fp) {
-            if (self.step()) |value| return value;
+            if (self.step()) |_| return null; // uncaught inside the callback
         }
+        if (self.escaped) return null;
         return self.stack.pop();
     }
 
@@ -488,25 +609,40 @@ pub const Machine = struct {
         self: *Machine,
         method: *abi.KeelMethod,
         args: []const abi.Value,
-    ) abi.Value {
+    ) ?abi.Value {
         const builtin = Builtin.fromId(method.id) orelse @panic("unknown builtin");
         switch (builtin) {
             .map => {
-                if (method.receiver.tag != abi.TAG_ARRAY) @panic("map on a non-array");
+                if (method.receiver.tag != abi.TAG_ARRAY) {
+                    if (self.throwMessage("TypeError: map is not a function on this value")) |result| {
+                        return result;
+                    }
+                    return null;
+                }
                 const array = method.receiver.asArray().?;
-                if (args.len < 1 or args[0].tag != abi.TAG_FUNCTION)
-                    @panic("map callback must be a function");
+                if (args.len < 1 or args[0].tag != abi.TAG_FUNCTION) {
+                    if (self.throwMessage("TypeError: map callback must be a function")) |result| {
+                        return result;
+                    }
+                    return null;
+                }
                 const callback = args[0];
                 const items = machineAllocator().alloc(abi.Value, array.len) catch @panic("out of memory");
                 for (0..array.len) |i| {
                     const element = array.items[i];
                     const index = abi.Value.fromInt(@intCast(i));
-                    items[i] = self.invoke(callback, &[_]abi.Value{ element, index, method.receiver });
+                    const result = self.invoke(callback, &[_]abi.Value{ element, index, method.receiver }) orelse return null;
+                    items[i] = result;
                 }
                 return allocArray(items);
             },
             .join => {
-                if (method.receiver.tag != abi.TAG_ARRAY) @panic("join on a non-array");
+                if (method.receiver.tag != abi.TAG_ARRAY) {
+                    if (self.throwMessage("TypeError: join is not a function on this value")) |result| {
+                        return result;
+                    }
+                    return null;
+                }
                 const array = method.receiver.asArray().?;
                 // JS default separator is ","; non-string separators coerce.
                 const separator: []const u8 = if (args.len > 0 and args[0].tag == abi.TAG_STRING)
@@ -529,16 +665,46 @@ pub const Machine = struct {
     }
 };
 
+const RunOutcome = struct {
+    value: abi.Value,
+    thrown: bool,
+};
+
+fn runOutcome(
+    instructions: []const abi.Instruction,
+    pool: []const abi.Value,
+    functions: []const abi.KeelFunction,
+) RunOutcome {
+    acquireMachine();
+    defer releaseMachine();
+    resetArena();
+    var machine = Machine.init(instructions, pool, functions);
+    const value = machine.execute();
+    return .{ .value = value, .thrown = machine.thrown };
+}
+
 pub fn run(
     instructions: []const abi.Instruction,
     pool: []const abi.Value,
     functions: []const abi.KeelFunction,
 ) abi.Value {
-    acquireMachine();
-    defer releaseMachine();
-    resetArena();
-    var machine = Machine.init(instructions, pool, functions);
-    return machine.execute();
+    return runOutcome(instructions, pool, functions).value;
+}
+
+/// Like `run`, but reports an uncaught thrown value through `err_out`.
+pub fn runErr(
+    instructions: []const abi.Instruction,
+    pool: []const abi.Value,
+    functions: []const abi.KeelFunction,
+    err_out: *abi.Value,
+) abi.Value {
+    const outcome = runOutcome(instructions, pool, functions);
+    if (outcome.thrown) {
+        err_out.* = outcome.value;
+        return abi.Value.UNDEF;
+    }
+    err_out.* = abi.Value.UNDEF;
+    return outcome.value;
 }
 
 pub export fn r8_machine_run(
@@ -548,8 +714,15 @@ pub export fn r8_machine_run(
     pool_len: usize,
     functions: [*]const abi.KeelFunction,
     functions_len: usize,
+    err_out: *abi.Value,
 ) abi.Value {
-    return run(instructions[0..len], pool[0..pool_len], functions[0..functions_len]);
+    const outcome = runOutcome(instructions[0..len], pool[0..pool_len], functions[0..functions_len]);
+    if (outcome.thrown) {
+        err_out.* = outcome.value;
+        return abi.Value.UNDEF;
+    }
+    err_out.* = abi.Value.UNDEF;
+    return outcome.value;
 }
 
 fn binaryArithmetic(kind: Arithmetic, machine: *Machine) void {
@@ -1714,4 +1887,124 @@ test "compound object property assignment via machine" {
     };
     const value = run(&code, &pool, &[_]abi.KeelFunction{});
     try std.testing.expectEqual(@as(?i64, 15), value.asInt());
+}
+
+test "try catches and binds the thrown value" {
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_TRY_ENTER, .operand = 5 }, // catch pc = 5
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_THROW, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 99 }, // skipped
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        // catch: the caught value is on the stack -> return it
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &[_]abi.KeelFunction{});
+    try std.testing.expectEqual(@as(?i64, 1), value.asInt());
+}
+
+test "try exit resumes normal flow" {
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_TRY_ENTER, .operand = 9 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 7 },
+        .{ .op = abi.OP_TRY_EXIT, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 99 }, // catch: never reached
+        .{ .op = abi.OP_POP, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &[_]abi.KeelFunction{});
+    try std.testing.expectEqual(@as(?i64, 7), value.asInt());
+}
+
+test "throws unwind across call frames to a caller handler" {
+    // main: try { f() } catch { return 42 }
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_CLOSURE, .operand = 1 },
+        .{ .op = abi.OP_TRY_ENTER, .operand = 5 },
+        .{ .op = abi.OP_CALL, .operand = 0 },
+        .{ .op = abi.OP_TRY_EXIT, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 }, // discard the caught value
+        .{ .op = abi.OP_LOAD_INT, .operand = 42 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        // f: throw 7
+        .{ .op = abi.OP_LOAD_INT, .operand = 7 },
+        .{ .op = abi.OP_THROW, .operand = 0 },
+    };
+    const functions = [_]abi.KeelFunction{
+        .{ .start = 0, .len = 8, .local_count = 0, .arity = 0 },
+        .{ .start = 8, .len = 2, .local_count = 0, .arity = 0 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &functions);
+    try std.testing.expectEqual(@as(?i64, 42), value.asInt());
+}
+
+test "a return inside try discards its handler" {
+    // main: try { return 1 } catch { return 2 }  -> the handler must not
+    // leak into later throws (there are none here, but the frame pop must
+    // clean up without corruption).
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_TRY_ENTER, .operand = 4 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &[_]abi.KeelFunction{});
+    try std.testing.expectEqual(@as(?i64, 1), value.asInt());
+}
+
+test "uncaught throws surface through err_out" {
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_THROW, .operand = 0 },
+    };
+    var boom = abi.KeelString{ .ptr = "boom".ptr, .len = 4 };
+    const pool = [_]abi.Value{.{
+        .tag = abi.TAG_STRING,
+        ._pad = 0,
+        .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&boom)))),
+    }};
+    var err: abi.Value = abi.Value.UNDEF;
+    const value = runErr(&code, &pool, &[_]abi.KeelFunction{}, &err);
+    try std.testing.expectEqual(abi.TAG_UNDEFINED, value.tag);
+    try std.testing.expectEqualStrings("boom", err.asString().?);
+}
+
+test "map callbacks may throw past the builtin" {
+    // try { [1].map(function () { throw "x"; }) } catch { } -> uncaught "x"
+    // escapes the program (no catch in main here: err_out carries it).
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_NEW_ARRAY, .operand = 1 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 }, // .map
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_TRY_ENTER, .operand = 9 },
+        .{ .op = abi.OP_CLOSURE, .operand = 1 },
+        .{ .op = abi.OP_CALL, .operand = 1 },
+        .{ .op = abi.OP_TRY_EXIT, .operand = 0 },
+        .{ .op = abi.OP_JMP, .operand = 12 },
+        // catch pc (9): the caught value is on top -> return it
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 1 }, // "not reached" (pc 10)
+        .{ .op = abi.OP_RETURN, .operand = 0 }, // (pc 11 = loop end target)
+        // function () { throw "x"; }
+        .{ .op = abi.OP_LOAD_STRING, .operand = 1 },
+        .{ .op = abi.OP_THROW, .operand = 0 },
+    };
+    var map_name = abi.KeelString{ .ptr = "map".ptr, .len = 3 };
+    var thrown_text = abi.KeelString{ .ptr = "x".ptr, .len = 1 };
+    const pool = [_]abi.Value{
+        .{ .tag = abi.TAG_STRING, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&map_name)))) },
+        .{ .tag = abi.TAG_STRING, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&thrown_text)))) },
+    };
+    const functions = [_]abi.KeelFunction{
+        .{ .start = 0, .len = 12, .local_count = 0, .arity = 0 },
+        .{ .start = 12, .len = 2, .local_count = 0, .arity = 0 },
+    };
+    var err: abi.Value = abi.Value.UNDEF;
+    const value = runErr(&code, &pool, &functions, &err);
+    try std.testing.expectEqual(abi.TAG_UNDEFINED, err.tag);
+    try std.testing.expectEqualStrings("x", value.asString().?);
 }

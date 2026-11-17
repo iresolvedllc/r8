@@ -36,9 +36,39 @@ cargo run -p r8-cli -- eval "'a' + 5"        # a5
 cargo run -p r8-cli -- eval "`x${1 + 1}y`"   # x2y
 cargo run -p r8-cli -- eval "((f, x) => f(f(x)))((v) => v * v, 3)"  # 81
 cargo run -p r8-cli -- eval "[1, 2, 3].map((v) => v * 2).join('-')" # 2-4-6
+cargo run -p r8-cli -- eval "try { throw 'e'; } catch (e) { e }"    # e
 cargo run -p r8-cli -- run tests/smoke/array.js
 cargo run -p r8-cli -- selftest              # runtime ABI + eval smoke test
 ```
+
+Not yet: `typeof`, `new`, classes, `break`/`continue`, `finally`, getters
+(see the roadmap and the conformance scoreboard).
+
+## Conformance
+
+R8 tracks its conformance against **Test262** (JS) and, once the DOM layer
+lands, **web-platform-tests**. The runner lives in `crates/r8-test262`:
+
+```sh
+bash scripts/fetch-corpus.sh                 # clone the pinned corpora
+cargo run -p r8-test262 -- \
+  --engine target/debug/r8 \
+  --suite language/types --suite language/literals \
+  --report conformance-results               # run + JSON/Markdown report
+cargo run -p r8-test262 -- --gate conformance/gates.txt   # enforce rates
+```
+
+- Corpora are cloned at pinned revisions (`corpus-versions`); local runs can
+  override with `R8_TEST262_ROOT` (e.g. an existing corpus checkout).
+- Tests are classified from their frontmatter; `module`/`async`/`generate`
+  tests and tests whose harness includes are not shimmed count as
+  **unsupported** (excluded from rates).
+- The shim harness (`crates/r8-test262/harness/`) reimplements the common
+  Test262 helpers with only currently-supported engine features; known
+  deviations are documented in the files.
+- `conformance/gates.txt` pins minimum pass rates per suite prefix; CI
+  (`conformance.yml`, nightly) runs the full suite and uploads the
+  scoreboard, and `ci.yml` enforces the gates on every push/PR.
 
 ## Layout
 
@@ -118,14 +148,19 @@ zig test zig/src/root.zig
 
 ## Roadmap
 
-| Phase | Milestone | Fixture gate |
+| Phase | Milestone | Gate |
 |---|---|---|
 | 1 ✅ | expression language + doubles | `tests/smoke/arith.js` |
 | 2 ✅ | variables, assignment, control flow, `&&`/`\|\|` | — |
 | 3 ✅ | strings, template literals, string semantics | `tests/smoke/strings.js` |
 | 4 ✅ | functions, calls, closures | — |
 | 5 ✅ | arrays, objects, property access, `.map`/`.join` | `tests/smoke/array.js` |
-| 6 | isolate/allocator wiring, GC, baseline tier, IR | — |
+| 6 ✅ | errors-as-values, `try`/`catch`/`throw` | Test262 gates (CI) |
+| 7 | Test262 scoreboard growth + runtime architecture (GC, isolates) | Test262 rates ↑ |
+| 8 | `r8-dom` + bindings (the Blink layer begins) | WPT `dom/` |
+| 9 | `r8-html`, `r8-css`, `r8-style` | WPT `html/syntax`, cssom |
+| 10 | `r8-layout` + `r8-paint` (CPU + GPU) | layout reftests, PNG snapshots |
+| 11 | `r8-shell` event loop + `r8-wpt` runner | WPT `html/` rates |
 
 ## License
 
