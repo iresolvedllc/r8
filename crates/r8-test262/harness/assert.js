@@ -1,26 +1,17 @@
 // R8 shim for Test262's `assert.js` harness — a subset implemented with only
-// the language features the R8 engine supports today (no `new`, `typeof`,
-// prototype machinery, or built-in globals).
+// the language features the R8 engine supports today (no `typeof`,
+// prototype machinery, or callable-with-properties `assert`).
 //
 // Known deviations from the real harness:
 // - `assert.throws` verifies that the function throws, but cannot verify the
-//   error CONSTRUCTOR yet (Error objects and `new` are not supported), so any
-//   throw counts as matching.
+//   error CONSTRUCTOR yet (instanceof is not implemented), so any throw
+//   counts as matching.
 // - `assert` is an object here; the real harness is also callable as
 //   `assert(cond, msg)` (callable-with-properties is an engine TODO).
+// - Error constructors (Error/TypeError/...) come from the engine's global
+//   object; the shim does not shadow them.
 const NaN = 0 / 0;
 const Infinity = 1 / 0;
-
-// Error-constructor stand-ins: tests pass these to `assert.throws`. The shim
-// cannot verify error types yet, so they only need to resolve.
-const Error = "@@Error";
-const TypeError = "@@TypeError";
-const SyntaxError = "@@SyntaxError";
-const RangeError = "@@RangeError";
-const ReferenceError = "@@ReferenceError";
-const EvalError = "@@EvalError";
-const URIError = "@@URIError";
-const AggregateError = "@@AggregateError";
 
 function sameValue(actual, expected) {
   if (actual !== actual && expected !== expected) {

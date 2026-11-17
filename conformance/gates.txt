@@ -4,7 +4,7 @@
 # engine grows, and never lower them.
 # Format: <suite-prefix> <min-pass-rate-percent>
 
-language/types 49
+language/types 59
 language/literals 71
 language/identifiers 49
 language/asi 67
@@ -18,6 +18,6 @@ language/future-reserved-words 99
 language/line-terminators 77
 language/source-text 0
 language/statementList 14
-language/block-scope 86
-language/expressions 29
+language/block-scope 87
+language/expressions 34
 language/statements 25

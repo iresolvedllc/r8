@@ -74,16 +74,117 @@ fn allocMethod(receiver: abi.Value, id: u32) abi.Value {
     return .{ .tag = abi.TAG_METHOD, ._pad = 0, .payload = @bitCast(@intFromPtr(keel_method)) };
 }
 
-/// Built-in methods reachable as property values. The u32 ids are part of
-/// the machine-internal `KeelMethod` representation.
+/// Built-in methods and global built-in functions reachable as property
+/// values. The u32 ids are part of the machine-internal `KeelMethod`
+/// representation; receivers are UNDEF for pure functions (e.g. Math.abs).
+/// Shared names (indexOf/slice/concat/includes) dispatch on the receiver's
+/// tag inside callBuiltin.
 const Builtin = enum(u32) {
     map = 0,
     join = 1,
+    str_char_at = 2,
+    str_char_code_at = 3,
+    index_of = 4,
+    slice = 5,
+    str_substring = 6,
+    str_to_upper_case = 7,
+    str_to_lower_case = 8,
+    includes = 9,
+    str_starts_with = 10,
+    str_ends_with = 11,
+    str_trim = 12,
+    str_split = 13,
+    str_repeat = 14,
+    str_replace = 15,
+    concat = 16,
+    arr_push = 17,
+    arr_pop = 18,
+    arr_shift = 19,
+    arr_unshift = 20,
+    arr_reverse = 21,
+    fn_is_array = 22,
+    math_abs = 23,
+    math_floor = 24,
+    math_ceil = 25,
+    math_round = 26,
+    math_trunc = 27,
+    math_min = 28,
+    math_max = 29,
+    math_sqrt = 30,
+    math_pow = 31,
+    math_sign = 32,
+    math_log = 33,
+    math_exp = 34,
+    num_is_nan = 35,
+    num_is_finite = 36,
+    num_is_integer = 37,
+    num_to_fixed = 38,
+    obj_keys = 39,
+    obj_values = 40,
+    obj_entries = 41,
+    to_string = 42,
+    err_ctor = 43,
+    num_constructor = 44,
+    num_parse_int = 45,
+    num_parse_float = 46,
+    obj_ctor = 47,
+    arr_ctor = 48,
+    bool_coerce = 49,
+    str_to_string_like = 50,
 
     fn fromId(id: u32) ?Builtin {
         return switch (id) {
             0 => .map,
             1 => .join,
+            2 => .str_char_at,
+            3 => .str_char_code_at,
+            4 => .index_of,
+            5 => .slice,
+            6 => .str_substring,
+            7 => .str_to_upper_case,
+            8 => .str_to_lower_case,
+            9 => .includes,
+            10 => .str_starts_with,
+            11 => .str_ends_with,
+            12 => .str_trim,
+            13 => .str_split,
+            14 => .str_repeat,
+            15 => .str_replace,
+            16 => .concat,
+            17 => .arr_push,
+            18 => .arr_pop,
+            19 => .arr_shift,
+            20 => .arr_unshift,
+            21 => .arr_reverse,
+            22 => .fn_is_array,
+            23 => .math_abs,
+            24 => .math_floor,
+            25 => .math_ceil,
+            26 => .math_round,
+            27 => .math_trunc,
+            28 => .math_min,
+            29 => .math_max,
+            30 => .math_sqrt,
+            31 => .math_pow,
+            32 => .math_sign,
+            33 => .math_log,
+            34 => .math_exp,
+            35 => .num_is_nan,
+            36 => .num_is_finite,
+            37 => .num_is_integer,
+            38 => .num_to_fixed,
+            39 => .obj_keys,
+            40 => .obj_values,
+            41 => .obj_entries,
+            42 => .to_string,
+            43 => .err_ctor,
+            44 => .num_constructor,
+            45 => .num_parse_int,
+            46 => .num_parse_float,
+            47 => .obj_ctor,
+            48 => .arr_ctor,
+            49 => .bool_coerce,
+            50 => .str_to_string_like,
             else => null,
         };
     }
@@ -559,6 +660,17 @@ pub const Machine = struct {
                 for (0..arg_count) |i| args[i] = self.stack.values[self.stack.sp - arg_count + i];
                 const fn_value = self.stack.values[self.stack.sp - arg_count - 1];
                 self.stack.sp -= arg_count + 1;
+                // Builtin constructors (Error/TypeError/...) take the OP_NEW
+                // path through callBuiltin; the builtin returns the object.
+                if (fn_value.tag == abi.TAG_METHOD) {
+                    const method: *abi.KeelMethod =
+                        @ptrFromInt(@as(usize, @bitCast(fn_value.payload)));
+                    if (self.callBuiltin(method, args[0..arg_count])) |result| {
+                        self.stack.push(result);
+                    }
+                    if (self.pending_throw) |thrown| return thrown;
+                    return null;
+                }
                 if (fn_value.tag != abi.TAG_FUNCTION) {
                     if (self.throwMessage("TypeError: not a constructor")) |result| {
                         return result;
@@ -725,6 +837,17 @@ pub const Machine = struct {
         self.pc = entry.start;
     }
 
+
+    /// Builds a builtin function value: a KeelMethod with an UNDEF receiver
+    /// (pure functions) whose id routes to the implementation.
+    fn builtinValue(self: *Machine, id: u32) abi.Value {
+        _ = self;
+        const allocator = machineAllocator();
+        const method = allocator.create(abi.KeelMethod) catch @panic("out of memory");
+        method.* = .{ .receiver = abi.Value.UNDEF, .id = id };
+        return .{ .tag = abi.TAG_METHOD, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(method)))) };
+    }
+
     /// Calls a function value with explicit arguments and returns its
     /// result, or null when the call escaped via a throw that a handler
     /// outside this call caught (execution continues at that catch pc) or
@@ -800,6 +923,660 @@ pub const Machine = struct {
                 }
                 return allocStringFrom(joined.items.ptr, joined.items.len);
             },
+            else => return self.callExtendedBuiltin(builtin, method.receiver, args),
+        }
+    }
+
+    /// The non-array-specialized builtin surface: string methods, array
+    /// mutators, Math/Object/Number globals. `receiver` is UNDEF for pure
+    /// functions.
+    fn callExtendedBuiltin(
+        self: *Machine,
+        builtin: Builtin,
+        receiver: abi.Value,
+        args: []const abi.Value,
+    ) ?abi.Value {
+        switch (builtin) {
+            // Handled by callBuiltin (array-specialized paths).
+            .map, .join => unreachable,
+
+            .str_to_string_like => {
+                // toString method on objects: stringify the receiver.
+                var text: [128]u8 = undefined;
+                const formatted = formatValue(receiver, &text) catch {
+                    return allocString(stringBytesOf(receiver));
+                };
+                return allocString(formatted);
+            },
+
+            // --- string methods (receiver must be a string) ---
+            .str_char_at, .str_char_code_at => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const bytes = receiver.asString().?;
+                const length = charCount(bytes);
+                const index = if (args.len > 0) args[0].toNumber() else 0;
+                const i: usize = if (std.math.isNan(index)) 0 else clampIndex(index, length);
+                if (i >= length) {
+                    if (builtin == .str_char_at) return allocString("");
+                    return abi.Value.fromFloat(std.math.nan(f64));
+                }
+                const offset = charOffset(bytes, i);
+                const len = std.unicode.utf8ByteSequenceLength(bytes[offset]) catch 1;
+                if (builtin == .str_char_at) {
+                    return allocString(bytes[offset .. offset + len]);
+                }
+                // charCodeAt: UTF-16 code unit. Non-BMP starters approximate
+                // to the leading code point (accepted gap).
+                const code_point = std.unicode.utf8Decode(bytes[offset .. offset + len]) catch 0;
+                return abi.Value.fromInt(code_point);
+            },
+            .str_to_upper_case, .str_to_lower_case => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const bytes = receiver.asString().?;
+                var out = std.ArrayList(u8).empty;
+                var i: usize = 0;
+                while (i < bytes.len) {
+                    const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
+                    const slice = bytes[i .. i + len];
+                    const code = std.unicode.utf8Decode(slice) catch {
+                        out.appendSlice(machineAllocator(), slice) catch @panic("out of memory");
+                        i += len;
+                        continue;
+                    };
+                    const mapped = if (builtin == .str_to_upper_case)
+                        toUpperCp(code)
+                    else
+                        toLowerCp(code);
+                    var buf: [4]u8 = undefined;
+                    const written = std.unicode.utf8Encode(mapped, &buf) catch 0;
+                    if (written > 0) {
+                        out.appendSlice(machineAllocator(), buf[0..written]) catch @panic("out of memory");
+                    } else {
+                        out.appendSlice(machineAllocator(), slice) catch @panic("out of memory");
+                    }
+                    i += len;
+                }
+                return allocStringFrom(out.items.ptr, out.items.len);
+            },
+            .str_trim => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const trimmed = std.mem.trim(u8, receiver.asString().?, " \t\n\r\x0b\x0c");
+                return allocString(trimmed);
+            },
+            .str_repeat => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const bytes = receiver.asString().?;
+                const count_f = if (args.len > 0) args[0].toNumber() else 0;
+                if (count_f < 0 or std.math.isInf(count_f)) {
+                    if (self.throwMessage("RangeError: repeat count must be non-negative")) |result| return result;
+                    return null;
+                }
+                const count: usize = @intFromFloat(@min(@trunc(count_f), 1e9));
+                var out = std.ArrayList(u8).empty;
+                for (0..count) |_| {
+                    out.appendSlice(machineAllocator(), bytes) catch @panic("out of memory");
+                }
+                return allocStringFrom(out.items.ptr, out.items.len);
+            },
+            .str_starts_with, .str_ends_with => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const bytes = receiver.asString().?;
+                const needle = if (args.len > 0 and args[0].tag == abi.TAG_STRING)
+                    args[0].asString().?
+                else if (args.len > 0)
+                    stringBytesOf(args[0])
+                else
+                    "";
+                const matched = if (builtin == .str_starts_with)
+                    std.mem.startsWith(u8, bytes, needle)
+                else
+                    std.mem.endsWith(u8, bytes, needle);
+                return abi.Value.fromBool(matched);
+            },
+            .str_substring => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const bytes = receiver.asString().?;
+                const length = charCount(bytes);
+                var start: i64 = 0;
+                var end: i64 = @intCast(length);
+                if (args.len > 0) {
+                    const f = args[0].toNumber();
+                    start = if (std.math.isNan(f)) 0 else clampI64(@trunc(f), 0, @intCast(length));
+                }
+                if (args.len > 1) {
+                    const f = args[1].toNumber();
+                    end = if (std.math.isNan(f)) @intCast(length) else clampI64(@trunc(f), 0, @intCast(length));
+                }
+                if (start > end) {
+                    const tmp = start;
+                    start = end;
+                    end = tmp;
+                }
+                const from = charOffset(bytes, @intCast(start));
+                const to = charOffset(bytes, @intCast(end));
+                return allocString(bytes[from..to]);
+            },
+            .str_split => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const bytes = receiver.asString().?;
+                var parts = std.ArrayList(abi.Value).empty;
+                const separator: ?[]const u8 = if (args.len == 0 or args[0].tag == abi.TAG_UNDEFINED)
+                    null
+                else
+                    stringBytesOf(args[0]);
+                if (separator) |sep| {
+                    if (sep.len == 0) {
+                        // Split into characters.
+                        var i: usize = 0;
+                        while (i < bytes.len) {
+                            const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
+                            parts.append(machineAllocator(), allocString(bytes[i .. i + len])) catch @panic("out of memory");
+                            i += len;
+                        }
+                    } else {
+                        var rest = bytes;
+                        while (std.mem.indexOf(u8, rest, sep)) |at| {
+                            parts.append(machineAllocator(), allocString(rest[0..at])) catch @panic("out of memory");
+                            rest = rest[at + sep.len ..];
+                        }
+                        parts.append(machineAllocator(), allocString(rest)) catch @panic("out of memory");
+                    }
+                } else {
+                    parts.append(machineAllocator(), allocString(bytes)) catch @panic("out of memory");
+                }
+                return allocArray(parts.items);
+            },
+            .str_replace => {
+                if (receiver.tag != abi.TAG_STRING) {
+                    if (self.throwMessage("TypeError: not a function on this value")) |result| return result;
+                    return null;
+                }
+                const bytes = receiver.asString().?;
+                if (args.len < 2) return allocString(bytes);
+                const needle = stringBytesOf(args[0]);
+                const replacement = stringBytesOf(args[1]);
+                if (std.mem.indexOf(u8, bytes, needle)) |at| {
+                    var out = std.ArrayList(u8).empty;
+                    out.appendSlice(machineAllocator(), bytes[0..at]) catch @panic("out of memory");
+                    out.appendSlice(machineAllocator(), replacement) catch @panic("out of memory");
+                    out.appendSlice(machineAllocator(), bytes[at + needle.len ..]) catch @panic("out of memory");
+                    return allocStringFrom(out.items.ptr, out.items.len);
+                }
+                return allocString(bytes);
+            },
+
+            // --- shared string/array names: dispatch on receiver tag ---
+            .index_of => {
+                if (receiver.tag == abi.TAG_STRING) {
+                    const bytes = receiver.asString().?;
+                    const needle = if (args.len > 0) stringBytesOf(args[0]) else "";
+                    const at = std.mem.indexOf(u8, bytes, needle);
+                    // JS indexOf reports UTF-16 code-unit positions; byte
+                    // offsets approximate (accepted gap for ASCII).
+                    if (at) |offset| {
+                        return abi.Value.fromInt(@intCast(offset));
+                    }
+                    return abi.Value.fromInt(-1);
+                }
+                if (receiver.tag == abi.TAG_ARRAY) {
+                    const array = receiver.asArray().?;
+                    const needle = if (args.len > 0) args[0] else abi.Value.UNDEF;
+                    for (0..array.len) |i| {
+                        if (equals(.strict, array.items[i], needle)) {
+                            return abi.Value.fromInt(@intCast(i));
+                        }
+                    }
+                    return abi.Value.fromInt(-1);
+                }
+                if (self.throwMessage("TypeError: indexOf is not a function on this value")) |result| return result;
+                return null;
+            },
+            .includes => {
+                if (receiver.tag == abi.TAG_STRING) {
+                    const bytes = receiver.asString().?;
+                    const needle = if (args.len > 0) stringBytesOf(args[0]) else "";
+                    return abi.Value.fromBool(std.mem.indexOf(u8, bytes, needle) != null);
+                }
+                if (receiver.tag == abi.TAG_ARRAY) {
+                    const array = receiver.asArray().?;
+                    const needle = if (args.len > 0) args[0] else abi.Value.UNDEF;
+                    for (0..array.len) |i| {
+                        if (equals(.strict, array.items[i], needle)) {
+                            return abi.Value.fromBool(true);
+                        }
+                    }
+                    return abi.Value.fromBool(false);
+                }
+                if (self.throwMessage("TypeError: includes is not a function on this value")) |result| return result;
+                return null;
+            },
+            .slice => {
+                if (receiver.tag == abi.TAG_STRING) {
+                    const bytes = receiver.asString().?;
+                    const length: i64 = @intCast(charCount(bytes));
+                    var start: i64 = 0;
+                    var end: i64 = length;
+                    if (args.len > 0) {
+                        const f = args[0].toNumber();
+                        start = if (std.math.isNan(f)) 0 else relIndexI64(f, length);
+                    }
+                    if (args.len > 1) {
+                        const f = args[1].toNumber();
+                        end = if (std.math.isNan(f)) length else relIndexI64(f, length);
+                    }
+                    if (start < 0) start = 0;
+                    if (end > length) end = length;
+                    if (start > end) start = end;
+                    const from = charOffset(bytes, @intCast(start));
+                    const to = charOffset(bytes, @intCast(end));
+                    return allocString(bytes[from..to]);
+                }
+                if (receiver.tag == abi.TAG_ARRAY) {
+                    const array = receiver.asArray().?;
+                    const length: i64 = @intCast(array.len);
+                    var start: i64 = 0;
+                    var end: i64 = length;
+                    if (args.len > 0) {
+                        const f = args[0].toNumber();
+                        start = if (std.math.isNan(f)) 0 else relIndexI64(f, length);
+                    }
+                    if (args.len > 1) {
+                        const f = args[1].toNumber();
+                        end = if (std.math.isNan(f)) length else relIndexI64(f, length);
+                    }
+                    if (start < 0) start = 0;
+                    if (end > length) end = length;
+                    if (start > end) start = end;
+                    const items = machineAllocator().alloc(abi.Value, @intCast(end - start)) catch @panic("out of memory");
+                    for (0..items.len) |i| items[i] = array.items[@as(usize, @intCast(start)) + i];
+                    return allocArray(items);
+                }
+                if (self.throwMessage("TypeError: slice is not a function on this value")) |result| return result;
+                return null;
+            },
+            .concat => {
+                if (receiver.tag == abi.TAG_ARRAY) {
+                    const array = receiver.asArray().?;
+                    var items = std.ArrayList(abi.Value).empty;
+                    for (0..array.len) |i| items.append(machineAllocator(), array.items[i]) catch @panic("out of memory");
+                    for (args) |arg| {
+                        if (arg.tag == abi.TAG_ARRAY) {
+                            const other = arg.asArray().?;
+                            for (0..other.len) |i| items.append(machineAllocator(), other.items[i]) catch @panic("out of memory");
+                        } else {
+                            items.append(machineAllocator(), arg) catch @panic("out of memory");
+                        }
+                    }
+                    return allocArray(items.items);
+                }
+                if (receiver.tag == abi.TAG_STRING) {
+                    var left = allocString(receiver.asString().?);
+                    for (args) |arg| {
+                        left = concatValues(left, arg);
+                    }
+                    return left;
+                }
+                if (self.throwMessage("TypeError: concat is not a function on this value")) |result| return result;
+                return null;
+            },
+
+            // --- array mutators ---
+            .arr_push => {
+                if (receiver.tag != abi.TAG_ARRAY) {
+                    if (self.throwMessage("TypeError: push is not a function on this value")) |result| return result;
+                    return null;
+                }
+                const array = receiver.asArray().?;
+                const allocator = machineAllocator();
+                const grown = allocator.alloc(abi.Value, array.len + args.len) catch @panic("out of memory");
+                @memcpy(grown[0..array.len], array.items[0..array.len]);
+                for (args, 0..) |arg, i| grown[array.len + i] = arg;
+                array.items = grown.ptr;
+                array.len = grown.len;
+                return abi.Value.fromInt(@intCast(array.len));
+            },
+            .arr_pop => {
+                if (receiver.tag != abi.TAG_ARRAY) {
+                    if (self.throwMessage("TypeError: pop is not a function on this value")) |result| return result;
+                    return null;
+                }
+                const array = receiver.asArray().?;
+                if (array.len == 0) return abi.Value.UNDEF;
+                const last = array.items[array.len - 1];
+                array.len -= 1;
+                return last;
+            },
+            .arr_shift => {
+                if (receiver.tag != abi.TAG_ARRAY) {
+                    if (self.throwMessage("TypeError: shift is not a function on this value")) |result| return result;
+                    return null;
+                }
+                const array = receiver.asArray().?;
+                if (array.len == 0) return abi.Value.UNDEF;
+                const first = array.items[0];
+                for (1..array.len) |i| array.items[i - 1] = array.items[i];
+                array.len -= 1;
+                return first;
+            },
+            .arr_unshift => {
+                if (receiver.tag != abi.TAG_ARRAY) {
+                    if (self.throwMessage("TypeError: unshift is not a function on this value")) |result| return result;
+                    return null;
+                }
+                const array = receiver.asArray().?;
+                const allocator = machineAllocator();
+                const grown = allocator.alloc(abi.Value, array.len + args.len) catch @panic("out of memory");
+                for (args, 0..) |arg, i| grown[i] = arg;
+                for (0..array.len) |i| grown[args.len + i] = array.items[i];
+                array.items = grown.ptr;
+                array.len = grown.len;
+                return abi.Value.fromInt(@intCast(array.len));
+            },
+            .arr_reverse => {
+                if (receiver.tag != abi.TAG_ARRAY) {
+                    if (self.throwMessage("TypeError: reverse is not a function on this value")) |result| return result;
+                    return null;
+                }
+                const array = receiver.asArray().?;
+                var lo: usize = 0;
+                var hi: usize = array.len;
+                while (lo + 1 < hi) {
+                    hi -= 1;
+                    const tmp = array.items[lo];
+                    array.items[lo] = array.items[hi];
+                    array.items[hi] = tmp;
+                    lo += 1;
+                }
+                return receiver;
+            },
+
+            // --- pure functions / constructors ---
+            .fn_is_array => {
+                return abi.Value.fromBool(args.len > 0 and args[0].tag == abi.TAG_ARRAY);
+            },
+            .math_abs, .math_floor, .math_ceil, .math_round, .math_trunc, .math_sqrt, .math_sign, .math_log, .math_exp => {
+                const x = if (args.len > 0) args[0].toNumber() else std.math.nan(f64);
+                const result: f64 = switch (builtin) {
+                    .math_abs => @abs(x),
+                    .math_floor => std.math.floor(x),
+                    .math_ceil => std.math.ceil(x),
+                    .math_round => jsRound(x),
+                    .math_trunc => @trunc(x),
+                    .math_sqrt => std.math.sqrt(@max(x, 0.0)),
+                    .math_sign => if (x > 0) 1.0 else if (x < 0) -1.0 else x,
+                    .math_log => std.math.log(f64, std.math.e, x),
+                    .math_exp => std.math.exp(x),
+                    else => unreachable,
+                };
+                if (std.math.isNan(result)) {
+                    return abi.Value.fromFloat(std.math.nan(f64));
+                }
+                return abi.Value.fromFloat(result);
+            },
+            .math_pow => {
+                const base = if (args.len > 0) args[0].toNumber() else std.math.nan(f64);
+                const exponent = if (args.len > 1) args[1].toNumber() else std.math.nan(f64);
+                return abi.Value.fromFloat(jsPow(base, exponent));
+            },
+            .math_min, .math_max => {
+                var best: f64 = if (builtin == .math_max) -std.math.inf(f64) else std.math.inf(f64);
+                for (args) |arg| {
+                    const x = arg.toNumber();
+                    if (std.math.isNan(x)) {
+                        return abi.Value.fromFloat(std.math.nan(f64));
+                    }
+                    best = if (builtin == .math_max) @max(best, x) else @min(best, x);
+                }
+                return abi.Value.fromFloat(best);
+            },
+            .num_is_nan => {
+                const x = if (args.len > 0) args[0].toNumber() else std.math.nan(f64);
+                return abi.Value.fromBool(std.math.isNan(x));
+            },
+            .num_is_finite => {
+                const x = if (args.len > 0) args[0].toNumber() else std.math.nan(f64);
+                return abi.Value.fromBool(!std.math.isNan(x) and !std.math.isInf(x));
+            },
+            .num_is_integer => {
+                const x = if (args.len > 0) args[0].toNumber() else std.math.nan(f64);
+                return abi.Value.fromBool(!std.math.isNan(x) and !std.math.isInf(x) and @trunc(x) == x);
+            },
+            .num_to_fixed => {
+                const x = if (args.len > 0) args[0].toNumber() else std.math.nan(f64);
+                const digits_f = if (args.len > 1) args[1].toNumber() else 0;
+                if (std.math.isNan(digits_f) or digits_f < 0 or digits_f > 100) {
+                    if (self.throwMessage("RangeError: toFixed() digits out of range")) |result| return result;
+                    return null;
+                }
+                const digits: usize = @intFromFloat(digits_f);
+                var text: [128]u8 = undefined;
+                const formatted = std.fmt.bufPrint(&text, "{d}", .{x}) catch return allocString(stringBytesOf(receiver));
+                // Trim to `digits` decimals (printf-style rounding fallback).
+                if (digits == 0) {
+                    const rounded = jsRound(x);
+                    const as_int: i64 = @intFromFloat(@trunc(rounded));
+                    return allocString(intToBytes(&text, as_int));
+                }
+                const scaled = x * std.math.pow(f64, 10, @floatFromInt(digits));
+                const rounded = jsRound(scaled) / std.math.pow(f64, 10, @floatFromInt(digits));
+                var out = std.ArrayList(u8).empty;
+                var fixed_buf: [200]u8 = undefined;
+                const printed = std.fmt.bufPrint(&fixed_buf, "{d}", .{rounded}) catch return allocString(formatted);
+                // Ensure exactly `digits` decimals by padding.
+                const dot = std.mem.indexOfScalar(u8, printed, '.');
+                if (dot == null) {
+                    out.appendSlice(machineAllocator(), printed) catch @panic("out of memory");
+                    if (digits > 0) {
+                        out.append(machineAllocator(), '.') catch @panic("out of memory");
+                    }
+                } else {
+                    out.appendSlice(machineAllocator(), printed) catch @panic("out of memory");
+                }
+                while (countDecimals(out.items) < digits) {
+                    out.append(machineAllocator(), '0') catch @panic("out of memory");
+                }
+                return allocStringFrom(out.items.ptr, out.items.len);
+            },
+            .obj_keys, .obj_values, .obj_entries => {
+                if (args.len == 0 or args[0].tag != abi.TAG_OBJECT) {
+                    if (self.throwMessage("TypeError: Object method needs an object")) |result| return result;
+                    return null;
+                }
+                const object = args[0].asObject().?;
+                if (builtin == .obj_keys) {
+                    const keys = machineAllocator().alloc(abi.Value, object.len) catch @panic("out of memory");
+                    for (0..object.len) |i| keys[i] = object.keys[i];
+                    return allocArray(keys);
+                }
+                if (builtin == .obj_values) {
+                    const values = machineAllocator().alloc(abi.Value, object.len) catch @panic("out of memory");
+                    for (0..object.len) |i| values[i] = object.values[i];
+                    return allocArray(values);
+                }
+                // entries: array of [key, value] arrays.
+                const entries = machineAllocator().alloc(abi.Value, object.len) catch @panic("out of memory");
+                for (0..object.len) |i| {
+                    const pair = machineAllocator().alloc(abi.Value, 2) catch @panic("out of memory");
+                    pair[0] = object.keys[i];
+                    pair[1] = object.values[i];
+                    entries[i] = allocArray(pair);
+                }
+                return allocArray(entries);
+            },
+            .err_ctor => {
+                // Error/TypeError/... constructor: builds { name, message }.
+                // Both `new Error(msg)` and plain `Error(msg)` construct —
+                // builtin constructors have no prototype-free distinction.
+                const object = allocObject(&[_]abi.Value{}, &[_]abi.Value{}).asObject().?;
+                appendProperty(object, allocString("name"), allocString("Error"));
+                const message_text = if (args.len > 0 and args[0].tag != abi.TAG_UNDEFINED)
+                    stringBytesOf(args[0])
+                else
+                    "";
+                appendProperty(object, allocString("message"), allocString(message_text));
+                return allocObject(object.keys[0..object.len], object.values[0..object.len]);
+            },
+            .to_string => {
+                // Constructor form (String(v)): stringify the first argument.
+                // Method form: stringify the receiver.
+                if (receiver.tag == abi.TAG_UNDEFINED) {
+                    const value = if (args.len > 0) args[0] else abi.Value.UNDEF;
+                    var text: [128]u8 = undefined;
+                    const formatted = formatValue(value, &text) catch {
+                        return allocString(stringBytesOf(value));
+                    };
+                    return allocString(formatted);
+                }
+                var text: [128]u8 = undefined;
+                const formatted = formatValue(receiver, &text) catch {
+                    return allocString(stringBytesOf(receiver));
+                };
+                return allocString(formatted);
+            },
+
+            // --- constructor builtins ---
+            .num_constructor => {
+                // Number(v): numeric coercion (wrapper objects later).
+                const x = if (args.len > 0) args[0].toNumber() else 0.0;
+                if (std.math.isNan(x)) {
+                    return abi.Value.fromFloat(std.math.nan(f64));
+                }
+                return abi.Value.fromFloat(x);
+            },
+            .bool_coerce => {
+                const value = if (args.len > 0) args[0] else abi.Value.UNDEF;
+                return abi.Value.fromBool(isTruthy(value));
+            },
+            .obj_ctor => {
+                // Object(v): returns the object as-is; undefined/null become
+                // empty objects; primitives pass through.
+                if (args.len == 0 or args[0].tag == abi.TAG_NULL or args[0].tag == abi.TAG_UNDEFINED) {
+                    return allocObject(&[_]abi.Value{}, &[_]abi.Value{});
+                }
+                return args[0];
+            },
+            .arr_ctor => {
+                // Array(...): a single numeric arg sizes the array; otherwise
+                // the args become elements.
+                if (args.len == 1 and args[0].tag == abi.TAG_INT) {
+                    const length: usize = @intCast(@max(args[0].payload, 0));
+                    const items = machineAllocator().alloc(abi.Value, length) catch @panic("out of memory");
+                    for (0..length) |i| items[i] = abi.Value.UNDEF;
+                    return allocArray(items);
+                }
+                return allocArray(args);
+            },
+            .num_parse_int => {
+                const text = if (args.len > 0) stringBytesOf(args[0]) else "";
+                const trimmed = std.mem.trim(u8, text, " \t\n\r\x0b\x0c");
+                // Optional sign, optional 0x/0o/0b prefix when radix 0/16.
+                var start: usize = 0;
+                var negative = false;
+                if (trimmed.len > 0 and (trimmed[0] == '+' or trimmed[0] == '-')) {
+                    negative = trimmed[0] == '-';
+                    start = 1;
+                }
+                var radix: u32 = if (args.len > 1) @intFromFloat(@max(args[1].toNumber(), 2)) else 10;
+                if (args.len < 2 or radix == 0 or radix == 16) {
+                    if (trimmed.len >= start + 2 and trimmed[start] == '0'
+                        and (trimmed[start + 1] == 'x' or trimmed[start + 1] == 'X'))
+                    {
+                        radix = 16;
+                        start += 2;
+                    } else if (radix == 0) {
+                        radix = 10;
+                    }
+                }
+                var value: f64 = std.math.nan(f64);
+                var acc: f64 = 0;
+                var digits: usize = 0;
+                for (trimmed[start..]) |c| {
+                    const digit: ?u32 = switch (c) {
+                        '0'...'9' => c - '0',
+                        'a'...'z' => c - 'a' + 10,
+                        'A'...'Z' => c - 'A' + 10,
+                        else => null,
+                    };
+                    if (digit == null or digit.? >= radix) break;
+                    acc = acc * @as(f64, @floatFromInt(radix)) + @as(f64, @floatFromInt(digit.?));
+                    digits += 1;
+                }
+                if (digits > 0) {
+                    value = if (negative) -acc else acc;
+                }
+                if (std.math.isNan(value)) {
+                    return abi.Value.fromFloat(std.math.nan(f64));
+                }
+                return abi.Value.fromFloat(@trunc(value));
+            },
+            .num_parse_float => {
+                const text = if (args.len > 0) stringBytesOf(args[0]) else "";
+                const trimmed = std.mem.trim(u8, text, " \t\n\r\x0b\x0c");
+                if (trimmed.len == 0) {
+                    return abi.Value.fromFloat(std.math.nan(f64));
+                }
+                // Infinity spellings.
+                if (std.mem.eql(u8, trimmed, "Infinity")) return abi.Value.fromFloat(std.math.inf(f64));
+                if (std.mem.eql(u8, trimmed, "+Infinity")) return abi.Value.fromFloat(std.math.inf(f64));
+                if (std.mem.eql(u8, trimmed, "-Infinity")) return abi.Value.fromFloat(-std.math.inf(f64));
+                // Longest numeric prefix (JS parseFloat semantics).
+                var end: usize = 0;
+                var seen_digit = false;
+                var seen_dot = false;
+                var seen_exp = false;
+                for (trimmed, 0..) |c, i| {
+                    const valid = switch (c) {
+                        '0'...'9' => blk: {
+                            seen_digit = true;
+                            break :blk true;
+                        },
+                        '+' => blk: {
+                            break :blk i == 0 or (i > 0 and (trimmed[i - 1] == 'e' or trimmed[i - 1] == 'E')) and !seen_exp;
+                        },
+                        '-' => blk: {
+                            break :blk i == 0 or (i > 0 and (trimmed[i - 1] == 'e' or trimmed[i - 1] == 'E')) and !seen_exp;
+                        },
+                        '.' => blk: {
+                            break :blk !seen_dot and !seen_exp;
+                        },
+                        'e', 'E' => blk: {
+                            break :blk seen_digit and !seen_exp;
+                        },
+                        else => false,
+                    };
+                    if (!valid) break;
+                    if (c == '.') seen_dot = true;
+                    if (c == 'e' or c == 'E') seen_exp = true;
+                    end = i + 1;
+                }
+                const prefix = trimmed[0..end];
+                if (!seen_digit) {
+                    return abi.Value.fromFloat(std.math.nan(f64));
+                }
+                const value = std.fmt.parseFloat(f64, prefix) catch std.math.nan(f64);
+                return abi.Value.fromFloat(value);
+            },
         }
     }
 };
@@ -819,8 +1596,11 @@ fn runOutcome(
     resetArena();
     var machine = Machine.init(instructions, pool, functions);
     // `this` in sloppy-mode global code: a fresh object per run. Created
-    // after the arena reset so it lives in this run's arena.
-    machine.global_object = allocObject(&[_]abi.Value{}, &[_]abi.Value{});
+    // after the arena reset so it lives in this run's arena, then populated
+    // with the builtin globals.
+    const global_object = allocObject(&[_]abi.Value{}, &[_]abi.Value{});
+    machine.global_object = global_object;
+    installGlobals(global_object.asObject().?);
     const value = machine.execute();
     return .{ .value = value, .thrown = machine.thrown };
 }
@@ -1070,6 +1850,111 @@ fn negate(value: abi.Value) abi.Value {
     }
 }
 
+/// Static properties on builtin constructors (`Number.isNaN`,
+/// `Object.keys`, `Array.isArray`, ...), dispatched from GET_INDEX on a
+/// TAG_METHOD receiver.
+fn builtinStatic(method: *abi.KeelMethod, name: []const u8) ?abi.Value {
+const builtin = Builtin.fromId(method.id) orelse return null;
+const Named = struct { name: []const u8, id: Builtin };
+const statics: []const Named = switch (builtin) {
+    .num_constructor => &[_]Named{
+        .{ .name = "isNaN", .id = .num_is_nan },
+        .{ .name = "isFinite", .id = .num_is_finite },
+        .{ .name = "isInteger", .id = .num_is_integer },
+        .{ .name = "parseFloat", .id = .num_parse_float },
+        .{ .name = "parseInt", .id = .num_parse_int },
+    },
+    .obj_ctor => &[_]Named{
+        .{ .name = "keys", .id = .obj_keys },
+        .{ .name = "values", .id = .obj_values },
+        .{ .name = "entries", .id = .obj_entries },
+    },
+    .arr_ctor => &[_]Named{
+        .{ .name = "isArray", .id = .fn_is_array },
+    },
+    else => &[_]Named{},
+};
+for (statics) |entry| {
+    if (std.mem.eql(u8, entry.name, name)) {
+        return builtinValueOf(@intFromEnum(entry.id));
+    }
+}
+return null;
+}
+
+/// Builds a builtin function value: a KeelMethod with an UNDEF receiver
+/// (pure functions) whose id routes to the implementation.
+fn builtinValueOf(id: u32) abi.Value {
+const allocator = machineAllocator();
+const method = allocator.create(abi.KeelMethod) catch @panic("out of memory");
+method.* = .{ .receiver = abi.Value.UNDEF, .id = id };
+return .{ .tag = abi.TAG_METHOD, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(method)))) };
+}
+
+
+/// Populates the global object with the builtin globals (Math, Number,
+/// Object, Array, error constructors, coercions).
+fn installGlobals(object: *abi.KeelObject) void {
+    const Named = struct { name: []const u8, id: Builtin };
+    const globals = [_]Named{
+        .{ .name = "String", .id = .to_string },
+        .{ .name = "Number", .id = .num_constructor },
+        .{ .name = "Boolean", .id = .bool_coerce },
+        .{ .name = "parseInt", .id = .num_parse_int },
+        .{ .name = "parseFloat", .id = .num_parse_float },
+        .{ .name = "isNaN", .id = .num_is_nan },
+        .{ .name = "isFinite", .id = .num_is_finite },
+        .{ .name = "Array", .id = .arr_ctor },
+        .{ .name = "Object", .id = .obj_ctor },
+        .{ .name = "Error", .id = .err_ctor },
+        .{ .name = "TypeError", .id = .err_ctor },
+        .{ .name = "RangeError", .id = .err_ctor },
+        .{ .name = "ReferenceError", .id = .err_ctor },
+        .{ .name = "SyntaxError", .id = .err_ctor },
+        .{ .name = "EvalError", .id = .err_ctor },
+    };
+    for (globals) |global| {
+        installGlobal(object, global.name, builtinValueOf(@intFromEnum(global.id)));
+    }
+
+    // Math: an object whose properties are builtin values.
+    const math = allocObject(&[_]abi.Value{}, &[_]abi.Value{});
+    const math_object = math.asObject().?;
+    const math_props = [_]Named{
+        .{ .name = "abs", .id = .math_abs },
+        .{ .name = "floor", .id = .math_floor },
+        .{ .name = "ceil", .id = .math_ceil },
+        .{ .name = "round", .id = .math_round },
+        .{ .name = "trunc", .id = .math_trunc },
+        .{ .name = "min", .id = .math_min },
+        .{ .name = "max", .id = .math_max },
+        .{ .name = "sqrt", .id = .math_sqrt },
+        .{ .name = "pow", .id = .math_pow },
+        .{ .name = "sign", .id = .math_sign },
+        .{ .name = "log", .id = .math_log },
+        .{ .name = "exp", .id = .math_exp },
+    };
+    for (math_props) |prop| {
+        installGlobal(math_object, prop.name, builtinValueOf(@intFromEnum(prop.id)));
+    }
+    installGlobal(math_object, "PI", abi.Value.fromFloat(std.math.pi));
+    installGlobal(object, "Math", math);
+
+    // NaN/Infinity: plain values.
+    installGlobal(object, "NaN", abi.Value.fromFloat(std.math.nan(f64)));
+    installGlobal(object, "Infinity", abi.Value.fromFloat(std.math.inf(f64)));
+}
+
+/// Sets (or appends) a property on a raw KeelObject.
+fn installGlobal(object: *abi.KeelObject, name: []const u8, value: abi.Value) void {
+    const key = allocString(name);
+    if (findKey(object, key)) |slot| {
+        object.values[slot] = value;
+    } else {
+        appendProperty(object, key, value);
+    }
+}
+
 /// JS GetV semantics for `receiver[key]` and `receiver.key`.
 fn getIndex(receiver: abi.Value, key: abi.Value) abi.Value {
     switch (receiver.tag) {
@@ -1087,8 +1972,12 @@ fn getIndex(receiver: abi.Value, key: abi.Value) abi.Value {
                 return abi.Value.UNDEF;
             }
             if (key.tag == abi.TAG_STRING) {
-                if (std.mem.eql(u8, key.asString().?, "length")) {
+                const name = key.asString().?;
+                if (std.mem.eql(u8, name, "length")) {
                     return abi.Value.fromInt(@intCast(charCount(bytes)));
+                }
+                if (builtinByName(name)) |builtin| {
+                    return allocMethod(receiver, @intFromEnum(builtin));
                 }
             }
             return abi.Value.UNDEF;
@@ -1130,6 +2019,16 @@ fn getIndex(receiver: abi.Value, key: abi.Value) abi.Value {
         },
         abi.TAG_NULL, abi.TAG_UNDEFINED => {
             @panic("cannot read properties of null or undefined");
+        },
+        abi.TAG_METHOD => {
+            // Builtin constructor statics: Number.isNaN, Object.keys, ...
+            const method: *abi.KeelMethod = @ptrFromInt(@as(usize, @bitCast(receiver.payload)));
+            if (key.tag == abi.TAG_STRING) {
+                if (builtinStatic(method, key.asString().?)) |value| {
+                    return value;
+                }
+            }
+            return abi.Value.UNDEF;
         },
         else => return abi.Value.UNDEF,
     }
@@ -1193,6 +2092,29 @@ fn setIndex(receiver: abi.Value, key: abi.Value, value: abi.Value) void {
 fn builtinByName(name: []const u8) ?Builtin {
     if (std.mem.eql(u8, name, "map")) return .map;
     if (std.mem.eql(u8, name, "join")) return .join;
+    if (std.mem.eql(u8, name, "charAt")) return .str_char_at;
+    if (std.mem.eql(u8, name, "charCodeAt")) return .str_char_code_at;
+    // indexOf/slice/concat exist on both strings and arrays; callBuiltin
+    // dispatches on the receiver's tag.
+    if (std.mem.eql(u8, name, "indexOf")) return .index_of;
+    if (std.mem.eql(u8, name, "slice")) return .slice;
+    if (std.mem.eql(u8, name, "concat")) return .concat;
+    if (std.mem.eql(u8, name, "substring")) return .str_substring;
+    if (std.mem.eql(u8, name, "toUpperCase")) return .str_to_upper_case;
+    if (std.mem.eql(u8, name, "toLowerCase")) return .str_to_lower_case;
+    if (std.mem.eql(u8, name, "includes")) return .includes;
+    if (std.mem.eql(u8, name, "startsWith")) return .str_starts_with;
+    if (std.mem.eql(u8, name, "endsWith")) return .str_ends_with;
+    if (std.mem.eql(u8, name, "trim")) return .str_trim;
+    if (std.mem.eql(u8, name, "split")) return .str_split;
+    if (std.mem.eql(u8, name, "repeat")) return .str_repeat;
+    if (std.mem.eql(u8, name, "replace")) return .str_replace;
+    if (std.mem.eql(u8, name, "push")) return .arr_push;
+    if (std.mem.eql(u8, name, "pop")) return .arr_pop;
+    if (std.mem.eql(u8, name, "shift")) return .arr_shift;
+    if (std.mem.eql(u8, name, "unshift")) return .arr_unshift;
+    if (std.mem.eql(u8, name, "reverse")) return .arr_reverse;
+    if (std.mem.eql(u8, name, "toString")) return .to_string;
     return null;
 }
 
@@ -1208,6 +2130,78 @@ fn toInt32(f: f64) i32 {
     const reduced = @rem(truncated, 4294967296.0);
     const as_i64: i64 = @intFromFloat(reduced);
     return @truncate(as_i64);
+}
+
+/// JS Math.round: half-up toward +Infinity (not banker's rounding).
+fn jsRound(f: f64) f64 {
+    if (std.math.isNan(f) or std.math.isInf(f)) return f;
+    return std.math.floor(f + 0.5);
+}
+
+/// JS Math.pow with the -0 exponent edge: (-0)**0.5-style cases fold to
+/// IEEE pow except +1 returns 1 even for NaN exponents (JS quirk).
+fn jsPow(base: f64, exponent: f64) f64 {
+    if (exponent == 0) return 1.0;
+    if (std.math.isNan(base) and exponent != 0) return std.math.nan(f64);
+    return std.math.pow(f64, base, exponent);
+}
+
+/// Clamps a float array index into [0, len] (NaN → 0).
+fn clampIndex(f: f64, len: usize) usize {
+    if (std.math.isNan(f)) return 0;
+    if (f <= 0) return 0;
+    const as_f: f64 = @floatFromInt(len);
+    if (f >= as_f) return len;
+    return @intFromFloat(f);
+}
+
+fn clampI64(f: f64, lo: i64, hi: i64) i64 {
+    if (std.math.isNan(f)) return lo;
+    if (f <= @as(f64, @floatFromInt(lo))) return lo;
+    if (f >= @as(f64, @floatFromInt(hi))) return hi;
+    return @intFromFloat(f);
+}
+
+/// Slice-style index: negatives count from the end (NaN → 0).
+fn relIndexI64(f: f64, len: i64) i64 {
+    if (std.math.isNan(f)) return 0;
+    const adjusted = if (f < 0) len + @as(i64, @intFromFloat(@trunc(f))) else @as(i64, @intFromFloat(@trunc(f)));
+    if (adjusted < 0) return 0;
+    if (adjusted > len) return len;
+    return adjusted;
+}
+
+fn countDecimals(bytes: []const u8) usize {
+    const dot = std.mem.indexOfScalar(u8, bytes, '.') orelse return 0;
+    return bytes.len - dot - 1;
+}
+
+fn intToBytes(buffer: []u8, value: i64) []const u8 {
+    return std.fmt.bufPrint(buffer, "{d}", .{value}) catch buffer[0..0];
+}
+
+/// ASCII-plane case mapping (full Unicode case tables arrive with ICU).
+fn toUpperCp(code: u21) u21 {
+    if (code >= 'a' and code <= 'z') return code - 32;
+    return code;
+}
+
+fn toLowerCp(code: u21) u21 {
+    if (code >= 'A' and code <= 'Z') return code + 32;
+    return code;
+}
+
+fn appendProperty(object: *abi.KeelObject, key: abi.Value, value: abi.Value) void {
+    const allocator = machineAllocator();
+    const grown_keys = allocator.alloc(abi.Value, object.len + 1) catch @panic("out of memory");
+    const grown_values = allocator.alloc(abi.Value, object.len + 1) catch @panic("out of memory");
+    @memcpy(grown_keys[0..object.len], object.keys[0..object.len]);
+    @memcpy(grown_values[0..object.len], object.values[0..object.len]);
+    grown_keys[object.len] = key;
+    grown_values[object.len] = value;
+    object.keys = grown_keys.ptr;
+    object.values = grown_values.ptr;
+    object.len += 1;
 }
 
 /// JS `key in receiver` over the value kinds that exist so far.
