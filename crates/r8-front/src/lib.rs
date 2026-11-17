@@ -30,6 +30,32 @@ pub enum AssignOp {
     MulAssign,
     DivAssign,
     ModAssign,
+    BitAndAssign,
+    BitOrAssign,
+    BitXorAssign,
+    ShlAssign,
+    ShrAssign,
+    UShrAssign,
+}
+
+impl AssignOp {
+    /// The read-modify-write binary operator for compound assignments.
+    pub const fn binary(self) -> Option<BinaryOp> {
+        match self {
+            Self::Assign => None,
+            Self::AddAssign => Some(BinaryOp::Add),
+            Self::SubAssign => Some(BinaryOp::Sub),
+            Self::MulAssign => Some(BinaryOp::Mul),
+            Self::DivAssign => Some(BinaryOp::Div),
+            Self::ModAssign => Some(BinaryOp::Mod),
+            Self::BitAndAssign => Some(BinaryOp::BitAnd),
+            Self::BitOrAssign => Some(BinaryOp::BitOr),
+            Self::BitXorAssign => Some(BinaryOp::BitXor),
+            Self::ShlAssign => Some(BinaryOp::Shl),
+            Self::ShrAssign => Some(BinaryOp::Shr),
+            Self::UShrAssign => Some(BinaryOp::UShr),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +74,13 @@ pub enum BinaryOp {
     Ne,
     EqStrict,
     NeStrict,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    UShr,
+    In,
     LogicalAnd,
     LogicalOr,
 }
@@ -71,6 +104,13 @@ impl BinaryOp {
             Self::Ne => Some(r8_abi::OP_NE),
             Self::EqStrict => Some(r8_abi::OP_EQ_STRICT),
             Self::NeStrict => Some(r8_abi::OP_NE_STRICT),
+            Self::BitAnd => Some(r8_abi::OP_BIT_AND),
+            Self::BitOr => Some(r8_abi::OP_BIT_OR),
+            Self::BitXor => Some(r8_abi::OP_BIT_XOR),
+            Self::Shl => Some(r8_abi::OP_SHL),
+            Self::Shr => Some(r8_abi::OP_SHR),
+            Self::UShr => Some(r8_abi::OP_USHR),
+            Self::In => Some(r8_abi::OP_IN),
             Self::LogicalAnd | Self::LogicalOr => None,
         }
     }
@@ -81,6 +121,12 @@ pub enum UnaryOp {
     Neg,
     Plus,
     Not,
+    BitNot,
+    TypeOf,
+    /// `void expr` — evaluates and discards.
+    Void,
+    /// `delete target` — compiled specially (member/index/variable forms).
+    Delete,
 }
 
 /// An arrow body: either a bare expression (its value is the return value)
@@ -154,12 +200,28 @@ pub enum Expr {
     Property(Box<Expr>, String),
     /// `receiver[key]`.
     Index(Box<Expr>, Box<Expr>),
+    /// `test ? consequent : alternate`.
+    Conditional(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `this` — the run's global object.
+    This,
+    /// `new callee(args)` — constructor call.
+    New {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Declarator {
     pub name: String,
     pub init: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchCase {
+    /// `None` for the `default` clause.
+    pub test: Option<Expr>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,11 +242,27 @@ pub enum Stmt {
         condition: Expr,
         body: Box<Stmt>,
     },
+    DoWhile {
+        condition: Expr,
+        body: Box<Stmt>,
+    },
     For {
         init: Option<Box<Stmt>>,
         condition: Option<Expr>,
         update: Option<Expr>,
         body: Box<Stmt>,
+    },
+    /// `for (binding in object)` — key enumeration; `binding` is `None` for
+    /// the bare `for (in ...)`-less form is invalid, so it is always a name
+    /// plus whether it declares (`let`/`var`) or assigns.
+    ForIn {
+        binding: Option<ForInBinding>,
+        object: Expr,
+        body: Box<Stmt>,
+    },
+    Switch {
+        discriminant: Expr,
+        cases: Vec<SwitchCase>,
     },
     Function {
         name: String,
@@ -199,6 +277,16 @@ pub enum Stmt {
         catch_body: Vec<Stmt>,
     },
     Throw(Expr),
+    Break,
+    Continue,
+}
+
+/// A `for-in` binding: a fresh declaration (`let`/`var`) or an assignment
+/// to an existing variable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForInBinding {
+    Declare(String),
+    Assign(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +322,19 @@ pub enum Token {
     PercentEq,
     AmpAmp,
     PipePipe,
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    UShr,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
+    UShrEq,
     LParen,
     RParen,
     LeftBrace,
@@ -242,6 +343,7 @@ pub enum Token {
     RightBracket,
     Dot,
     Colon,
+    Question,
     Comma,
     Semicolon,
     EqArrow,
@@ -259,6 +361,18 @@ pub enum Token {
     Catch,
     Finally,
     Throw,
+    In,
+    TypeOf,
+    This,
+    New,
+    Do,
+    Switch,
+    Case,
+    Default,
+    Void,
+    Delete,
+    Break,
+    Continue,
     True,
     False,
     Null,
@@ -302,6 +416,10 @@ pub enum CompileError {
     ConstAssignment(String),
     #[error("too many locals")]
     TooManyLocals,
+    #[error("expected a for-in binding")]
+    ExpectedBinding,
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
 /// Bytecode plus its string-constant pool and function table; all three are
@@ -328,6 +446,13 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
         tokens: Vec::new(),
         modes: vec![LexMode::Normal],
     };
+    // Hashbang comment: `#!` at the very start of the source.
+    if characters.len() > 1 && characters[0] == '#' && characters[1] == '!' {
+        lexer.index = 2;
+        while lexer.index < characters.len() && characters[lexer.index] != '\n' {
+            lexer.index += 1;
+        }
+    }
     while lexer.index < lexer.characters.len() {
         lexer.step()?;
     }
@@ -633,22 +758,49 @@ impl Lexer<'_> {
                 if self.characters.get(self.index + 1) == Some(&'&') {
                     self.tokens.push(Token::AmpAmp);
                     self.index += 2;
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::AmpEq);
+                    self.index += 2;
                 } else {
-                    // Bitwise `&` is not supported yet.
-                    return Err(ParseError::Unexpected('&'));
+                    self.tokens.push(Token::Amp);
+                    self.index += 1;
                 }
             }
             '|' => {
                 if self.characters.get(self.index + 1) == Some(&'|') {
                     self.tokens.push(Token::PipePipe);
                     self.index += 2;
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::PipeEq);
+                    self.index += 2;
                 } else {
-                    // Bitwise `|` is not supported yet.
-                    return Err(ParseError::Unexpected('|'));
+                    self.tokens.push(Token::Pipe);
+                    self.index += 1;
                 }
             }
-            '<' => {
+            '^' => {
                 if self.characters.get(self.index + 1) == Some(&'=') {
+                    self.tokens.push(Token::CaretEq);
+                    self.index += 2;
+                } else {
+                    self.tokens.push(Token::Caret);
+                    self.index += 1;
+                }
+            }
+            '~' => {
+                self.tokens.push(Token::Tilde);
+                self.index += 1;
+            }
+            '<' => {
+                if self.characters.get(self.index + 1) == Some(&'<') {
+                    if self.characters.get(self.index + 2) == Some(&'=') {
+                        self.tokens.push(Token::ShlEq);
+                        self.index += 3;
+                    } else {
+                        self.tokens.push(Token::Shl);
+                        self.index += 2;
+                    }
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
                     self.tokens.push(Token::Le);
                     self.index += 2;
                 } else {
@@ -657,7 +809,23 @@ impl Lexer<'_> {
                 }
             }
             '>' => {
-                if self.characters.get(self.index + 1) == Some(&'=') {
+                if self.characters.get(self.index + 1) == Some(&'>') {
+                    if self.characters.get(self.index + 2) == Some(&'>') {
+                        if self.characters.get(self.index + 3) == Some(&'=') {
+                            self.tokens.push(Token::UShrEq);
+                            self.index += 4;
+                        } else {
+                            self.tokens.push(Token::UShr);
+                            self.index += 3;
+                        }
+                    } else if self.characters.get(self.index + 2) == Some(&'=') {
+                        self.tokens.push(Token::ShrEq);
+                        self.index += 3;
+                    } else {
+                        self.tokens.push(Token::Shr);
+                        self.index += 2;
+                    }
+                } else if self.characters.get(self.index + 1) == Some(&'=') {
                     self.tokens.push(Token::Ge);
                     self.index += 2;
                 } else {
@@ -710,6 +878,10 @@ impl Lexer<'_> {
                 self.tokens.push(Token::Colon);
                 self.index += 1;
             }
+            '?' => {
+                self.tokens.push(Token::Question);
+                self.index += 1;
+            }
             '.' => {
                 if self
                     .characters
@@ -735,8 +907,10 @@ impl Lexer<'_> {
                 self.tokens
                     .push(lex_number(self.characters, &mut self.index)?);
             }
-            c if is_identifier_start(c) => {
-                let identifier = lex_identifier(self.characters, &mut self.index);
+            c if is_identifier_start(c)
+                || (c == '\\' && self.characters.get(self.index + 1) == Some(&'u')) =>
+            {
+                let identifier = lex_identifier(self.characters, &mut self.index)?;
                 self.tokens.push(match identifier.as_str() {
                     "let" => Token::Let,
                     "var" => Token::Var,
@@ -744,6 +918,14 @@ impl Lexer<'_> {
                     "if" => Token::If,
                     "else" => Token::Else,
                     "while" => Token::While,
+                    "do" => Token::Do,
+                    "switch" => Token::Switch,
+                    "case" => Token::Case,
+                    "default" => Token::Default,
+                    "void" => Token::Void,
+                    "delete" => Token::Delete,
+                    "break" => Token::Break,
+                    "continue" => Token::Continue,
                     "for" => Token::For,
                     "function" => Token::Function,
                     "return" => Token::Return,
@@ -751,6 +933,10 @@ impl Lexer<'_> {
                     "catch" => Token::Catch,
                     "finally" => Token::Finally,
                     "throw" => Token::Throw,
+                    "in" => Token::In,
+                    "typeof" => Token::TypeOf,
+                    "this" => Token::This,
+                    "new" => Token::New,
                     "true" => Token::True,
                     "false" => Token::False,
                     "null" => Token::Null,
@@ -835,19 +1021,73 @@ fn lex_number(characters: &[char], index: &mut usize) -> Result<Token, ParseErro
     Ok(Token::Int(value))
 }
 
-fn lex_identifier(characters: &[char], index: &mut usize) -> String {
+/// Lexes an identifier, resolving `\uXXXX` / `\u{hex}` escapes inside it
+/// (`var a\u0041` names the same binding as `var aA`).
+fn lex_identifier(characters: &[char], index: &mut usize) -> Result<String, ParseError> {
     let mut text = String::new();
-    while *index < characters.len() && is_identifier_part(characters[*index]) {
-        text.push(characters[*index]);
-        *index += 1;
+    while *index < characters.len() {
+        let character = characters[*index];
+        if is_identifier_part(character) {
+            text.push(character);
+            *index += 1;
+            continue;
+        }
+        if character == '\\' && characters.get(*index + 1) == Some(&'u') {
+            *index += 2;
+            let code = if characters.get(*index) == Some(&'{') {
+                // `\u{hex}` form.
+                *index += 1;
+                let mut code: u32 = 0;
+                let mut digits = 0;
+                while let Some(&c) = characters.get(*index) {
+                    if c == '}' {
+                        break;
+                    }
+                    let digit = c.to_digit(16).ok_or(ParseError::InvalidEscape)?;
+                    code = code
+                        .checked_mul(16)
+                        .and_then(|h| h.checked_add(digit))
+                        .ok_or(ParseError::InvalidEscape)?;
+                    digits += 1;
+                    *index += 1;
+                }
+                if characters.get(*index) != Some(&'}') || digits == 0 {
+                    return Err(ParseError::InvalidEscape);
+                }
+                *index += 1;
+                code
+            } else {
+                // `\uXXXX` form.
+                let mut code: u32 = 0;
+                for _ in 0..4 {
+                    let c = *characters.get(*index).ok_or(ParseError::InvalidEscape)?;
+                    let digit = c.to_digit(16).ok_or(ParseError::InvalidEscape)?;
+                    code = code * 16 + digit;
+                    *index += 1;
+                }
+                code
+            };
+            let escaped = char::from_u32(code).ok_or(ParseError::InvalidEscape)?;
+            // The escaped code point must itself be an identifier part.
+            if !is_identifier_part(escaped) {
+                return Err(ParseError::InvalidEscape);
+            }
+            text.push(escaped);
+            continue;
+        }
+        break;
     }
-    text
+    Ok(text)
 }
 
 /// Parses a single expression (the `eval` form).
 pub fn parse(source: &str) -> Result<Expr, ParseError> {
     let tokens = tokenize(source)?;
-    let mut parser = Parser { tokens, index: 0 };
+    let mut parser = Parser {
+        tokens,
+        index: 0,
+        no_in: false,
+    };
     let expression = parser.expression()?;
     while parser.peek() == &Token::Semicolon {
         parser.index += 1;
@@ -863,7 +1103,11 @@ pub fn parse(source: &str) -> Result<Expr, ParseError> {
 /// need one (a deliberately small slice of ASI).
 pub fn parse_program(source: &str) -> Result<Vec<Stmt>, ParseError> {
     let tokens = tokenize(source)?;
-    let mut parser = Parser { tokens, index: 0 };
+    let mut parser = Parser {
+        tokens,
+        index: 0,
+        no_in: false,
+    };
     let mut program = Vec::new();
     loop {
         while parser.peek() == &Token::Semicolon {
@@ -880,6 +1124,9 @@ pub fn parse_program(source: &str) -> Result<Vec<Stmt>, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     index: usize,
+    /// For-heads disallow the bare `in` operator (`for (a in b;;)` is a
+    /// SyntaxError); set while parsing a for-init.
+    no_in: bool,
 }
 
 impl Parser {
@@ -915,7 +1162,7 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Result<Expr, ParseError> {
-        let left = self.logical_or()?;
+        let left = self.conditional()?;
         let op = match self.peek() {
             Token::EqAssign => AssignOp::Assign,
             Token::PlusEq => AssignOp::AddAssign,
@@ -923,6 +1170,12 @@ impl Parser {
             Token::StarEq => AssignOp::MulAssign,
             Token::SlashEq => AssignOp::DivAssign,
             Token::PercentEq => AssignOp::ModAssign,
+            Token::AmpEq => AssignOp::BitAndAssign,
+            Token::PipeEq => AssignOp::BitOrAssign,
+            Token::CaretEq => AssignOp::BitXorAssign,
+            Token::ShlEq => AssignOp::ShlAssign,
+            Token::ShrEq => AssignOp::ShrAssign,
+            Token::UShrEq => AssignOp::UShrAssign,
             _ => return Ok(left),
         };
         self.index += 1;
@@ -932,6 +1185,40 @@ impl Parser {
         }
         let value = self.assignment()?;
         Ok(Expr::Assign(op, Box::new(left), Box::new(value)))
+    }
+
+    /// `cond ? consequent : alternate` (right-assoc, above assignment).
+    /// In a no-in context the branches parse with the same restriction.
+    fn conditional(&mut self) -> Result<Expr, ParseError> {
+        let test = self.logical_or()?;
+        if self.peek() != &Token::Question {
+            return Ok(test);
+        }
+        self.index += 1;
+        let consequent = if self.no_in {
+            self.no_in_assignment()
+        } else {
+            self.assignment()
+        }?;
+        self.expect(&Token::Colon)?;
+        let alternate = if self.no_in {
+            self.no_in_assignment()
+        } else {
+            self.assignment()
+        }?;
+        Ok(Expr::Conditional(
+            Box::new(test),
+            Box::new(consequent),
+            Box::new(alternate),
+        ))
+    }
+
+    /// An assignment-level expression with `in` disallowed (for-heads).
+    fn no_in_assignment(&mut self) -> Result<Expr, ParseError> {
+        self.no_in = true;
+        let result = self.assignment();
+        self.no_in = false;
+        result
     }
 
     fn logical_or(&mut self) -> Result<Expr, ParseError> {
@@ -945,11 +1232,42 @@ impl Parser {
     }
 
     fn logical_and(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.equality()?;
+        let mut left = self.bit_or()?;
         while self.peek() == &Token::AmpAmp {
             self.index += 1;
-            let right = self.equality()?;
+            let right = self.bit_or()?;
             left = Expr::Binary(BinaryOp::LogicalAnd, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// Bitwise OR is the loosest bitwise level (above logical AND).
+    fn bit_or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.bit_xor()?;
+        while self.peek() == &Token::Pipe {
+            self.index += 1;
+            let right = self.bit_xor()?;
+            left = Expr::Binary(BinaryOp::BitOr, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn bit_xor(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.bit_and()?;
+        while self.peek() == &Token::Caret {
+            self.index += 1;
+            let right = self.bit_and()?;
+            left = Expr::Binary(BinaryOp::BitXor, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn bit_and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.equality()?;
+        while self.peek() == &Token::Amp {
+            self.index += 1;
+            let right = self.equality()?;
+            left = Expr::Binary(BinaryOp::BitAnd, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
@@ -979,6 +1297,7 @@ impl Parser {
                 Token::Gt => BinaryOp::Gt,
                 Token::Le => BinaryOp::Le,
                 Token::Ge => BinaryOp::Ge,
+                Token::In if !self.no_in => BinaryOp::In,
                 _ => break,
             };
             self.index += 1;
@@ -988,8 +1307,26 @@ impl Parser {
         Ok(left)
     }
 
-    fn additive(&mut self) -> Result<Expr, ParseError> {
+    /// Shifts sit between additive and relational in the JS precedence
+    /// chain.
+    fn shift(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Token::Shl => BinaryOp::Shl,
+                Token::Shr => BinaryOp::Shr,
+                Token::UShr => BinaryOp::UShr,
+                _ => break,
+            };
+            self.index += 1;
+            let right = self.multiplicative()?;
+            left = Expr::Binary(op, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn additive(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.shift()?;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinaryOp::Add,
@@ -1037,6 +1374,10 @@ impl Parser {
             Token::Minus => UnaryOp::Neg,
             Token::Plus => UnaryOp::Plus,
             Token::Bang => UnaryOp::Not,
+            Token::Tilde => UnaryOp::BitNot,
+            Token::TypeOf => UnaryOp::TypeOf,
+            Token::Void => UnaryOp::Void,
+            Token::Delete => UnaryOp::Delete,
             _ => return self.postfix(),
         };
         self.index += 1;
@@ -1103,6 +1444,22 @@ impl Parser {
             Token::For => "for".into(),
             Token::Function => "function".into(),
             Token::Return => "return".into(),
+            Token::Try => "try".into(),
+            Token::Catch => "catch".into(),
+            Token::Finally => "finally".into(),
+            Token::Throw => "throw".into(),
+            Token::In => "in".into(),
+            Token::TypeOf => "typeof".into(),
+            Token::This => "this".into(),
+            Token::New => "new".into(),
+            Token::Do => "do".into(),
+            Token::Switch => "switch".into(),
+            Token::Case => "case".into(),
+            Token::Default => "default".into(),
+            Token::Void => "void".into(),
+            Token::Delete => "delete".into(),
+            Token::Break => "break".into(),
+            Token::Continue => "continue".into(),
             Token::True => "true".into(),
             Token::False => "false".into(),
             Token::Null => "null".into(),
@@ -1201,6 +1558,7 @@ impl Parser {
             Token::False => Ok(Expr::Bool(false)),
             Token::Null => Ok(Expr::Null),
             Token::Undefined => Ok(Expr::Undefined),
+            Token::This => Ok(Expr::This),
             Token::Identifier(name) if name == "console" => self.console_log(),
             Token::Identifier(name) => {
                 if self.tokens.get(self.index) == Some(&Token::EqArrow) {
@@ -1231,6 +1589,7 @@ impl Parser {
                 }
             }
             Token::Function => self.function_expression(),
+            Token::New => self.new_expression(),
             Token::Eof => Err(ParseError::UnexpectedEnd),
             _ => Err(ParseError::ExpectedExpression),
         }
@@ -1256,6 +1615,57 @@ impl Parser {
                 _ => return false,
             }
         }
+    }
+
+    /// Parses `new callee` / `new callee(args)` — member chains after the
+    /// callee are parsed by the surrounding postfix loop. A member-only
+    /// form (`new Error` with no call) becomes a zero-argument construct.
+    /// The `new` token was already consumed by `primary`.
+    fn new_expression(&mut self) -> Result<Expr, ParseError> {
+        // The callee: a postfix chain restricted to property/index access
+        // (calls at this position belong to the constructed call itself).
+        let mut callee = self.primary()?;
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    self.index += 1;
+                    let name = self.property_name()?;
+                    callee = Expr::Property(Box::new(callee), name);
+                }
+                Token::LeftBracket => {
+                    self.index += 1;
+                    let key = self.assignment()?;
+                    match self.next() {
+                        Token::RightBracket => {}
+                        Token::Eof => return Err(ParseError::UnexpectedEnd),
+                        _ => return Err(ParseError::TrailingInput),
+                    }
+                    callee = Expr::Index(Box::new(callee), Box::new(key));
+                }
+                _ => break,
+            }
+        }
+        let mut arguments = Vec::new();
+        if self.peek() == &Token::LParen {
+            self.index += 1;
+            if self.peek() == &Token::RParen {
+                self.index += 1;
+            } else {
+                loop {
+                    arguments.push(self.assignment()?);
+                    match self.next() {
+                        Token::Comma => {}
+                        Token::RParen => break,
+                        Token::Eof => return Err(ParseError::UnexpectedEnd),
+                        _ => return Err(ParseError::TrailingInput),
+                    }
+                }
+            }
+        }
+        Ok(Expr::New {
+            callee: Box::new(callee),
+            args: arguments,
+        })
     }
 
     /// Parses the body after `=>`: a braced block or a bare expression.
@@ -1345,11 +1755,23 @@ impl Parser {
             }
             Token::If => self.if_statement(),
             Token::While => self.while_statement(),
+            Token::Do => self.do_while_statement(),
+            Token::Switch => self.switch_statement(),
             Token::For => self.for_statement(),
             Token::Function => self.function_declaration(),
             Token::Return => self.return_statement(),
             Token::Try => self.try_statement(),
             Token::Throw => self.throw_statement(),
+            Token::Break => {
+                self.next();
+                self.end_statement()?;
+                Ok(Stmt::Break)
+            }
+            Token::Continue => {
+                self.next();
+                self.end_statement()?;
+                Ok(Stmt::Continue)
+            }
             Token::LeftBrace => {
                 self.next();
                 Ok(Stmt::Block(self.block_body()?))
@@ -1543,19 +1965,115 @@ impl Parser {
         Ok(Stmt::While { condition, body })
     }
 
+    fn do_while_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.next(); // `do`
+        let body = Box::new(self.statement()?);
+        self.expect(&Token::While)?;
+        self.expect(&Token::LParen)?;
+        let condition = self.expression()?;
+        self.expect(&Token::RParen)?;
+        // A semicolon is optional after do-while (ASI-lite).
+        if self.peek() == &Token::Semicolon {
+            self.index += 1;
+        }
+        Ok(Stmt::DoWhile { condition, body })
+    }
+
+    fn switch_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.next(); // `switch`
+        self.expect(&Token::LParen)?;
+        let discriminant = self.expression()?;
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::LeftBrace)?;
+        let mut cases = Vec::new();
+        loop {
+            while self.peek() == &Token::Semicolon {
+                self.index += 1;
+            }
+            match self.peek() {
+                Token::RightBrace => {
+                    self.index += 1;
+                    break;
+                }
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                Token::Case => {
+                    self.index += 1;
+                    let test = self.expression()?;
+                    self.expect(&Token::Colon)?;
+                    let body = self.case_body()?;
+                    cases.push(SwitchCase {
+                        test: Some(test),
+                        body,
+                    });
+                }
+                Token::Default => {
+                    self.index += 1;
+                    self.expect(&Token::Colon)?;
+                    let body = self.case_body()?;
+                    cases.push(SwitchCase { test: None, body });
+                }
+                _ => return Err(ParseError::ExpectedExpression),
+            }
+        }
+        Ok(Stmt::Switch {
+            discriminant,
+            cases,
+        })
+    }
+
+    /// Statements after a `case:`/`default:` label, up to the next case,
+    /// `default`, or the closing brace.
+    fn case_body(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        let mut statements = Vec::new();
+        loop {
+            while self.peek() == &Token::Semicolon {
+                self.index += 1;
+            }
+            match self.peek() {
+                Token::RightBrace | Token::Case | Token::Default | Token::Eof => break,
+                _ => statements.push(self.statement()?),
+            }
+        }
+        Ok(statements)
+    }
+
     fn for_statement(&mut self) -> Result<Stmt, ParseError> {
         self.next(); // `for`
         self.expect(&Token::LParen)?;
+        // `in` is banned in for-head init expressions per the spec.
+        self.no_in = true;
         let init = if self.peek() == &Token::Semicolon {
             self.index += 1;
             None
         } else if matches!(self.peek(), Token::Let | Token::Var | Token::Const) {
-            // Detect `for (let x of ...)` / `for (let x in ...)` up front for
-            // a clear error instead of tripping over the initializer rules.
-            if let Some(Token::Identifier(after_name)) = self.tokens.get(self.index + 2)
-                && (after_name == "of" || after_name == "in")
-            {
-                return Err(ParseError::Unsupported("for-of and for-in loops"));
+            // Detect `for (let x in ...)` (the `in` KEYWORD sits two tokens
+            // past the declaration keyword) and `for (let x of ...)` for a
+            // clear error.
+            match self.tokens.get(self.index + 2) {
+                Some(Token::In) => {
+                    // for-in with a fresh declaration.
+                    self.next(); // the declaration keyword
+                    let name = match self.next() {
+                        Token::Identifier(name) => name,
+                        Token::Eof => return Err(ParseError::UnexpectedEnd),
+                        _ => return Err(ParseError::ExpectedIdentifier),
+                    };
+                    self.expect(&Token::In)?;
+                    let object = self.no_in_assignment()?;
+                    self.no_in = false;
+                    self.expect(&Token::RParen)?;
+                    let body = Box::new(self.statement()?);
+                    return Ok(Stmt::ForIn {
+                        binding: Some(ForInBinding::Declare(name)),
+                        object,
+                        body,
+                    });
+                }
+                Some(Token::Identifier(word)) if word == "of" => {
+                    self.no_in = false;
+                    return Err(ParseError::Unsupported("for-of and for-in loops"));
+                }
+                _ => {}
             }
             let is_const = self.peek() == &Token::Const;
             self.next();
@@ -1563,6 +2081,7 @@ impl Parser {
             if let Token::Identifier(name) = self.peek()
                 && (name == "of" || name == "in")
             {
+                self.no_in = false;
                 return Err(ParseError::Unsupported("for-of and for-in loops"));
             }
             self.expect(&Token::Semicolon)?;
@@ -1573,9 +2092,27 @@ impl Parser {
             }))
         } else {
             let expression = self.expression()?;
+            // `for (x in o)` — assignment to an existing variable.
+            if self.peek() == &Token::In {
+                self.no_in = false;
+                let target = match expression {
+                    Expr::Var(name) => name,
+                    _ => return Err(ParseError::Unsupported("only simple assignment targets")),
+                };
+                self.index += 1; // `in`
+                let object = self.assignment()?;
+                self.expect(&Token::RParen)?;
+                let body = Box::new(self.statement()?);
+                return Ok(Stmt::ForIn {
+                    binding: Some(ForInBinding::Assign(target)),
+                    object,
+                    body,
+                });
+            }
             self.expect(&Token::Semicolon)?;
             Some(Box::new(Stmt::Expression(expression)))
         };
+        self.no_in = false;
         let condition = if self.peek() == &Token::Semicolon {
             None
         } else {
@@ -1681,6 +2218,19 @@ struct Compiler {
     functions: Vec<KeelFunction>,
     states: Vec<FunctionState>,
     completed: Vec<FunctionState>,
+    /// Open loops/switches for `break`/`continue` jump collection.
+    loops: Vec<LoopContext>,
+}
+
+/// One open `break`/`continue` scope. Breaks always land on the loop end;
+/// continues land on the loop's continue point (condition or update).
+/// Switches only accept breaks.
+#[derive(Default)]
+struct LoopContext {
+    break_patches: Vec<usize>,
+    continue_patches: Vec<usize>,
+    /// Switch bodies must not `continue` to this scope.
+    has_continue: bool,
 }
 
 impl Compiler {
@@ -1692,7 +2242,70 @@ impl Compiler {
             functions: Vec::new(),
             states: Vec::new(),
             completed: Vec::new(),
+            loops: Vec::new(),
         }
+    }
+
+    /// Registers a `break` jump inside the innermost loop/switch.
+    fn register_break(&mut self) -> Result<(), CompileError> {
+        let jump = self.emit(Instruction::jmp(0));
+        match self.loops.last_mut() {
+            Some(context) => {
+                context.break_patches.push(jump);
+                Ok(())
+            }
+            None => Err(CompileError::Unsupported("break outside a loop")),
+        }
+    }
+
+    /// Registers a `continue` jump inside the innermost loop.
+    fn register_continue(&mut self) -> Result<(), CompileError> {
+        let jump = self.emit(Instruction::jmp(0));
+        match self.loops.last_mut() {
+            Some(context) if context.has_continue => {
+                context.continue_patches.push(jump);
+                Ok(())
+            }
+            Some(_) => Err(CompileError::Unsupported("continue outside a loop")),
+            None => Err(CompileError::Unsupported("continue outside a loop")),
+        }
+    }
+
+    /// Patches all pending `continue` jumps of the innermost loop.
+    fn patch_continues(&mut self, target: usize) {
+        let jumps = match self.loops.last_mut() {
+            Some(context) => std::mem::take(&mut context.continue_patches),
+            None => return,
+        };
+        for jump in jumps {
+            self.patch(jump, target);
+        }
+    }
+
+    /// Closes the innermost loop/switch: patches breaks to `end`.
+    fn finish_loop(&mut self, end: usize) {
+        if let Some(context) = self.loops.pop() {
+            for jump in context.break_patches {
+                self.patch(jump, end);
+            }
+        }
+    }
+
+    /// Allocates an unnamed local slot (loop temporaries).
+    fn declare_temp(&mut self) -> Result<usize, CompileError> {
+        let slot = self
+            .states
+            .last()
+            .expect("compiling a function")
+            .local_count;
+        if slot >= LOCAL_COUNT {
+            return Err(CompileError::TooManyLocals);
+        }
+        self.states
+            .last_mut()
+            .expect("compiling a function")
+            .local_count += 1;
+        Ok(slot)
     }
 
     /// Concatenates completed function buffers into the flat instruction
@@ -1993,10 +2606,44 @@ impl Compiler {
                 }
                 Self::walk_statement(body, bound, captured, free);
             }
+            Stmt::DoWhile { condition, body } => {
+                Self::walk_expr(condition, bound, captured, free);
+                Self::walk_statement(body, bound, captured, free);
+            }
+            Stmt::ForIn {
+                binding,
+                object,
+                body,
+            } => {
+                match binding {
+                    Some(ForInBinding::Declare(name)) => {
+                        bound.insert(name.clone());
+                    }
+                    Some(ForInBinding::Assign(name)) if !bound.contains(name) => {
+                        free.insert(name.clone());
+                    }
+                    Some(ForInBinding::Assign(_)) | None => {}
+                }
+                Self::walk_expr(object, bound, captured, free);
+                Self::walk_statement(body, bound, captured, free);
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                Self::walk_expr(discriminant, bound, captured, free);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        Self::walk_expr(test, bound, captured, free);
+                    }
+                    Self::walk_statements(&case.body, bound, captured, free);
+                }
+            }
             Stmt::Function { name, params, body } => {
                 bound.insert(name.clone());
                 Self::walk_nested_function(params, body, None, bound, captured, free);
             }
+            Stmt::Break | Stmt::Continue => {}
             Stmt::Return(Some(expression)) => Self::walk_expr(expression, bound, captured, free),
             Stmt::Return(None) => {}
             Stmt::Try {
@@ -2021,8 +2668,19 @@ impl Compiler {
         free: &mut HashSet<String>,
     ) {
         match expression {
-            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined => {}
+            Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::Undefined
+            | Expr::This => {}
             Expr::String(_) => {}
+            Expr::New { callee, args } => {
+                Self::walk_expr(callee, bound, captured, free);
+                for argument in args {
+                    Self::walk_expr(argument, bound, captured, free);
+                }
+            }
             Expr::Var(name) => {
                 if !bound.contains(name) {
                     free.insert(name.clone());
@@ -2070,6 +2728,11 @@ impl Compiler {
                 Self::walk_expr(right, bound, captured, free);
             }
             Expr::Unary(_, operand) => Self::walk_expr(operand, bound, captured, free),
+            Expr::Conditional(test, consequent, alternate) => {
+                Self::walk_expr(test, bound, captured, free);
+                Self::walk_expr(consequent, bound, captured, free);
+                Self::walk_expr(alternate, bound, captured, free);
+            }
             Expr::Call(callee, arguments) => {
                 Self::walk_expr(callee, bound, captured, free);
                 for argument in arguments {
@@ -2174,11 +2837,27 @@ impl Compiler {
                 Some(Resolved::Upvalue { index, .. }) => {
                     self.emit(Instruction::get_upvalue(index));
                 }
-                None => return Err(CompileError::Undeclared(name.clone())),
+                // Sloppy-mode global fallback: a missing binding reads the
+                // global object (ReferenceError at runtime when absent).
+                None => {
+                    let index = self.string_index(name);
+                    self.emit(Instruction::global_get(index));
+                }
             },
             Expr::String(text) => {
                 let index = self.string_index(text);
                 self.emit(Instruction::load_string(index));
+            }
+            Expr::This => {
+                self.emit(Instruction::this_());
+            }
+            Expr::New { callee, args } => {
+                // Callee first, then arguments (OP_NEW pops them).
+                self.expression(callee)?;
+                for argument in args {
+                    self.expression(argument)?;
+                }
+                self.emit(Instruction::new_(args.len()));
             }
             Expr::Array(elements) => {
                 for element in elements {
@@ -2295,13 +2974,19 @@ impl Compiler {
             }
             Expr::Assign(op, target, value) => match target.as_ref() {
                 Expr::Var(name) => {
-                    let resolved = match self.resolve(name) {
-                        Some(resolved) => resolved,
-                        None => return Err(CompileError::Undeclared(name.clone())),
-                    };
+                    // Sloppy mode: assignments to undeclared names create
+                    // (or overwrite) global properties.
+                    let resolved = self.resolve(name);
+                    let mut global_name_index: Option<usize> = None;
                     let (slot, index, is_const) = match resolved {
-                        Resolved::Local { slot, is_const } => (Some(slot), None, is_const),
-                        Resolved::Upvalue { index, is_const } => (None, Some(index), is_const),
+                        Some(Resolved::Local { slot, is_const }) => (Some(slot), None, is_const),
+                        Some(Resolved::Upvalue { index, is_const }) => {
+                            (None, Some(index), is_const)
+                        }
+                        None => {
+                            global_name_index = Some(self.string_index(name));
+                            (None, None, false)
+                        }
                     };
                     if is_const {
                         return Err(CompileError::ConstAssignment(name.clone()));
@@ -2314,18 +2999,15 @@ impl Compiler {
                         if let Some(index) = index {
                             self.emit(Instruction::get_upvalue(index));
                         }
+                        if let Some(global) = global_name_index {
+                            self.emit(Instruction::global_get(global));
+                        }
                     }
                     self.expression(value)?;
-                    let opcode = match op {
-                        AssignOp::Assign => None,
-                        AssignOp::AddAssign => BinaryOp::Add.opcode(),
-                        AssignOp::SubAssign => BinaryOp::Sub.opcode(),
-                        AssignOp::MulAssign => BinaryOp::Mul.opcode(),
-                        AssignOp::DivAssign => BinaryOp::Div.opcode(),
-                        AssignOp::ModAssign => BinaryOp::Mod.opcode(),
-                    };
-                    if let Some(opcode) = opcode {
-                        self.emit(Instruction::binary(opcode));
+                    if let Some(binary_op) = op.binary() {
+                        self.emit(Instruction::binary(
+                            binary_op.opcode().expect("non-logical op"),
+                        ));
                     }
                     // The assignment expression's value is the assigned value.
                     self.emit(Instruction::dup());
@@ -2334,6 +3016,9 @@ impl Compiler {
                     }
                     if let Some(index) = index {
                         self.emit(Instruction::set_upvalue(index));
+                    }
+                    if let Some(global) = global_name_index {
+                        self.emit(Instruction::global_set(global));
                     }
                 }
                 Expr::Property(receiver, name) => {
@@ -2351,14 +3036,7 @@ impl Compiler {
                         self.emit(Instruction::load_string(key_index));
                         self.emit(Instruction::get_index());
                         self.expression(value)?;
-                        let opcode = match op {
-                            AssignOp::AddAssign => BinaryOp::Add,
-                            AssignOp::SubAssign => BinaryOp::Sub,
-                            AssignOp::MulAssign => BinaryOp::Mul,
-                            AssignOp::DivAssign => BinaryOp::Div,
-                            AssignOp::ModAssign => BinaryOp::Mod,
-                            AssignOp::Assign => unreachable!(),
-                        };
+                        let opcode = op.binary().expect("compound op");
                         self.emit(Instruction::binary(
                             opcode.opcode().expect("non-logical op"),
                         ));
@@ -2379,14 +3057,7 @@ impl Compiler {
                         self.expression(key)?;
                         self.emit(Instruction::get_index());
                         self.expression(value)?;
-                        let opcode = match op {
-                            AssignOp::AddAssign => BinaryOp::Add,
-                            AssignOp::SubAssign => BinaryOp::Sub,
-                            AssignOp::MulAssign => BinaryOp::Mul,
-                            AssignOp::DivAssign => BinaryOp::Div,
-                            AssignOp::ModAssign => BinaryOp::Mod,
-                            AssignOp::Assign => unreachable!(),
-                        };
+                        let opcode = op.binary().expect("compound op");
                         self.emit(Instruction::binary(
                             opcode.opcode().expect("non-logical op"),
                         ));
@@ -2431,19 +3102,93 @@ impl Compiler {
                 }
             },
             Expr::Unary(op, operand) => {
-                self.expression(operand)?;
                 match op {
+                    // `typeof x` must not throw for undeclared variables:
+                    // unresolved names compile to undefined + typeof.
+                    UnaryOp::TypeOf => {
+                        let declared = match operand.as_ref() {
+                            Expr::Var(name) => self.resolve(name).is_some(),
+                            _ => true,
+                        };
+                        if declared {
+                            self.expression(operand)?;
+                        } else {
+                            self.emit(Instruction::load_undefined());
+                        }
+                        self.emit(Instruction::typeof_());
+                    }
+                    UnaryOp::Void => {
+                        self.expression(operand)?;
+                        self.emit(Instruction::pop());
+                        self.emit(Instruction::load_undefined());
+                    }
+                    UnaryOp::Delete => {
+                        // Only member/index/variable targets are meaningful.
+                        match operand.as_ref() {
+                            Expr::Property(recv, name) => {
+                                self.expression(recv)?;
+                                let key_index = self.string_index(name);
+                                self.emit(Instruction::load_string(key_index));
+                                self.emit(Instruction::delete());
+                            }
+                            Expr::Index(recv, key) => {
+                                self.expression(recv)?;
+                                self.expression(key)?;
+                                self.emit(Instruction::delete());
+                            }
+                            Expr::Var(name) => {
+                                // Sloppy-mode `delete binding` is false.
+                                let _ = self.resolve(name);
+                                self.emit(Instruction::load_bool(false));
+                            }
+                            other => {
+                                self.expression(other)?;
+                                self.emit(Instruction::pop());
+                                self.emit(Instruction::load_bool(true));
+                            }
+                        }
+                    }
+                    UnaryOp::BitNot => {
+                        self.expression(operand)?;
+                        self.emit(Instruction::bit_not());
+                    }
                     UnaryOp::Neg => {
+                        self.expression(operand)?;
                         self.emit(Instruction::unary(r8_abi::OP_NEG));
                     }
                     UnaryOp::Not => {
+                        self.expression(operand)?;
                         self.emit(Instruction::unary(r8_abi::OP_NOT));
                     }
                     // Unary plus is numeric coercion. Current operand types
                     // are numbers except booleans (`+true` should be 1 — TODO
                     // with numeric coercion ops).
-                    UnaryOp::Plus => {}
+                    UnaryOp::Plus => {
+                        self.expression(operand)?;
+                    }
                 }
+            }
+            Expr::Conditional(test, consequent, alternate) => {
+                // test; jmp-if-false else; consequent; jmp end; else: alt
+                self.expression(test)?;
+                let else_jump = self.emit(Instruction::jmp_if_false(0));
+                self.expression(consequent)?;
+                let end_jump = self.emit(Instruction::jmp(0));
+                let else_start = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch(else_jump, else_start);
+                self.expression(alternate)?;
+                let end = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch(end_jump, end);
             }
             Expr::ConsoleLog(argument) => {
                 self.expression(argument)?;
@@ -2549,7 +3294,13 @@ impl Compiler {
                     .len();
                 self.expression(condition)?;
                 let end_jump = self.emit(Instruction::jmp_if_false(0));
+                self.loops.push(LoopContext {
+                    has_continue: true,
+                    ..LoopContext::default()
+                });
                 self.statement(body, false)?;
+                // continue lands on the condition.
+                self.patch_continues(loop_start);
                 self.emit(Instruction::jmp(loop_start));
                 let end = self
                     .states
@@ -2558,6 +3309,7 @@ impl Compiler {
                     .buffer
                     .len();
                 self.patch(end_jump, end);
+                self.finish_loop(end);
             }
             Stmt::For {
                 init,
@@ -2586,10 +3338,24 @@ impl Compiler {
                     }
                 }
                 let end_jump = self.emit(Instruction::jmp_if_false(0));
+                self.loops.push(LoopContext {
+                    has_continue: true,
+                    ..LoopContext::default()
+                });
                 self.statement(body, false)?;
                 if let Some(update) = update {
+                    // continue lands on the update.
+                    let update_start = self
+                        .states
+                        .last()
+                        .expect("compiling a function")
+                        .buffer
+                        .len();
+                    self.patch_continues(update_start);
                     self.expression(update)?;
                     self.emit(Instruction::pop());
+                } else {
+                    self.patch_continues(loop_start);
                 }
                 self.emit(Instruction::jmp(loop_start));
                 let end = self
@@ -2599,6 +3365,7 @@ impl Compiler {
                     .buffer
                     .len();
                 self.patch(end_jump, end);
+                self.finish_loop(end);
                 self.scopes.pop();
             }
             Stmt::Function { name, params, body } => {
@@ -2674,6 +3441,183 @@ impl Compiler {
             Stmt::Throw(expression) => {
                 self.expression(expression)?;
                 self.emit(Instruction::throw());
+            }
+            Stmt::Break => {
+                self.register_break()?;
+            }
+            Stmt::Continue => {
+                self.register_continue()?;
+            }
+            Stmt::DoWhile { condition, body } => {
+                self.loops.push(LoopContext {
+                    has_continue: true,
+                    ..LoopContext::default()
+                });
+                let loop_start = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.statement(body, false)?;
+                // continue lands on the condition (after the body).
+                let condition_start = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch_continues(condition_start);
+                self.expression(condition)?;
+                let exit = self.emit(Instruction::jmp_if_false(0));
+                self.emit(Instruction::jmp(loop_start));
+                let end = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch(exit, end);
+                self.finish_loop(end);
+            }
+            Stmt::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.expression(discriminant)?;
+                let slot = self.declare_temp()?;
+                self.emit(Instruction::set_local(slot));
+                // Switch is a break target but not a continue target.
+                self.loops.push(LoopContext {
+                    has_continue: false,
+                    ..LoopContext::default()
+                });
+                // Test chain: each non-default case compares the saved
+                // discriminant and jumps to its body.
+                let mut body_jumps: Vec<(usize, usize)> = Vec::new(); // (jump index, case index)
+                let mut default_index: Option<usize> = None;
+                for (index, case) in cases.iter().enumerate() {
+                    match &case.test {
+                        Some(test) => {
+                            self.emit(Instruction::get_local(slot));
+                            self.expression(test)?;
+                            self.emit(Instruction::binary(r8_abi::OP_EQ_STRICT));
+                            let jump = self.emit(Instruction::jmp_if_true(0));
+                            body_jumps.push((jump, index));
+                        }
+                        None => {
+                            if default_index.is_some() {
+                                return Err(CompileError::Unsupported("multiple default clauses"));
+                            }
+                            default_index = Some(index);
+                        }
+                    }
+                }
+                // No case matched: jump to default (or past the whole thing).
+                let fallthrough = self.emit(Instruction::jmp(0));
+                // Bodies in source order (fall-through is adjacency).
+                for (index, case) in cases.iter().enumerate() {
+                    let body_start = self
+                        .states
+                        .last()
+                        .expect("compiling a function")
+                        .buffer
+                        .len();
+                    for jump_index in body_jumps.iter().filter(|(_, i)| *i == index) {
+                        let (jump, _) = *jump_index;
+                        self.patch(jump, body_start);
+                    }
+                    if default_index == Some(index) {
+                        self.patch(fallthrough, body_start);
+                    }
+                    for statement in &case.body {
+                        self.statement(statement, false)?;
+                    }
+                }
+                let end = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                if default_index.is_none() {
+                    self.patch(fallthrough, end);
+                }
+                self.finish_loop(end);
+            }
+            Stmt::ForIn {
+                binding,
+                object,
+                body,
+            } => {
+                self.scopes.push(Scope {
+                    bindings: HashMap::new(),
+                });
+                let binding_slot = match binding {
+                    Some(ForInBinding::Declare(name)) => self.declare(name, false)?,
+                    Some(ForInBinding::Assign(name)) => match self.resolve(name) {
+                        Some(Resolved::Local { slot, is_const }) => {
+                            if is_const {
+                                return Err(CompileError::ConstAssignment(name.clone()));
+                            }
+                            slot
+                        }
+                        Some(Resolved::Upvalue { .. }) => {
+                            return Err(CompileError::Unsupported(
+                                "for-in over closed-over variables",
+                            ));
+                        }
+                        None => return Err(CompileError::Undeclared(name.clone())),
+                    },
+                    None => return Err(CompileError::ExpectedBinding),
+                };
+                self.expression(object)?;
+                self.emit(Instruction::keys());
+                let keys_slot = self.declare_temp()?;
+                self.emit(Instruction::set_local(keys_slot));
+                let index_slot = self.declare_temp()?;
+                self.emit(Instruction::load_int(0));
+                self.emit(Instruction::set_local(index_slot));
+                self.loops.push(LoopContext::default());
+                let loop_start = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                // keys[idx] -> key or undefined; undefined is falsy so the
+                // conditional jump exits the loop.
+                self.emit(Instruction::get_local(index_slot));
+                self.emit(Instruction::get_local(keys_slot));
+                self.emit(Instruction::get_local(index_slot));
+                self.emit(Instruction::get_index());
+                self.emit(Instruction::dup());
+                let exit = self.emit(Instruction::jmp_if_false(0));
+                self.emit(Instruction::set_local(binding_slot));
+                self.statement(body, false)?;
+                // continue jumps to the increment.
+                let increment = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch_continues(increment);
+                self.emit(Instruction::get_local(index_slot));
+                self.emit(Instruction::load_int(1));
+                self.emit(Instruction::binary(r8_abi::OP_ADD));
+                self.emit(Instruction::set_local(index_slot));
+                self.emit(Instruction::jmp(loop_start));
+                let end = self
+                    .states
+                    .last()
+                    .expect("compiling a function")
+                    .buffer
+                    .len();
+                self.patch(exit, end);
+                self.finish_loop(end);
+                self.emit(Instruction::pop()); // the trailing key/undefined
+                self.scopes.pop();
             }
         }
         Ok(())
@@ -3218,16 +4162,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_for_of_and_for_in() {
-        // Bracket-free sources: `[` would fail in the lexer first.
+    fn rejects_for_of() {
         assert_eq!(
             parse_program("for (const x of 1) { }").unwrap_err(),
             ParseError::Unsupported("for-of and for-in loops")
         );
-        assert_eq!(
-            parse_program("for (let x in 1) { }").unwrap_err(),
-            ParseError::Unsupported("for-of and for-in loops")
-        );
+        // for-in itself is supported now.
+        assert!(matches!(
+            parse_program("for (let k in o) { }").unwrap()[0],
+            Stmt::ForIn { .. }
+        ));
     }
 
     #[test]
@@ -3403,21 +4347,20 @@ mod tests {
 
     #[test]
     fn reports_compile_errors() {
-        assert_eq!(
-            compile(&parse("x").unwrap()).unwrap_err(),
-            CompileError::Undeclared("x".into())
-        );
+        // Undeclared reads are NOT compile errors anymore: they compile to
+        // global fallback (runtime ReferenceError) — sloppy semantics.
+        let compiled = compile(&parse("x").unwrap()).unwrap();
+        assert_eq!(compiled.instructions[0].op, r8_abi::OP_GLOBAL_GET);
         let program = parse_program("const x = 1; x = 2;").unwrap();
         assert_eq!(
             compile_program(&program).unwrap_err(),
             CompileError::ConstAssignment("x".into())
         );
-        // TDZ approximation: the initializer cannot see its own binding.
+        // TDZ approximation changed: the initializer falls back to the
+        // global read (the runtime ReferenceError covers `let x = x` too).
         let program = parse_program("let x = x;").unwrap();
-        assert_eq!(
-            compile_program(&program).unwrap_err(),
-            CompileError::Undeclared("x".into())
-        );
+        let compiled = compile_program(&program).unwrap();
+        assert_eq!(compiled.instructions[0].op, r8_abi::OP_GLOBAL_GET);
     }
 
     #[test]

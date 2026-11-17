@@ -30,8 +30,12 @@
 //! stack (catch pc, stack depth, frame), `OP_THROW` unwinds to the nearest
 //! handler or out of the program, and `r8_machine_run` gains an `err_out`
 //! parameter that receives the uncaught thrown value (or `undefined`).
+//!
+//! ABI v8 adds the language-surface opcodes: `this` (bound to a per-run
+//! global object), `typeof`, the 32-bit bitwise/shift set, `in`, `delete`,
+//! and object key enumeration (for `for-in`).
 
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 8;
 
 /// Value tags. `CONFORMANCE_TAGS` lists these in a canonical order; keep both
 /// in sync with `zig/src/abi.zig`.
@@ -146,6 +150,46 @@ pub const OP_TRY_EXIT: u32 = 45;
 /// (restoring the try-entry state and pushing the caught value), or — after
 /// unwinding call frames — out of the program through `err_out`.
 pub const OP_THROW: u32 = 46;
+/// Pushes `this`: the run's global object (sloppy-mode global semantics).
+pub const OP_THIS: u32 = 47;
+/// Pops a value; pushes its `typeof` string ("undefined", "boolean",
+/// "number", "string", "function", or "object" — including for null).
+pub const OP_TYPEOF: u32 = 48;
+/// 32-bit bitwise AND (`ToInt32` on both operands).
+pub const OP_BIT_AND: u32 = 49;
+/// 32-bit bitwise OR.
+pub const OP_BIT_OR: u32 = 50;
+/// 32-bit bitwise XOR.
+pub const OP_BIT_XOR: u32 = 51;
+/// 32-bit left shift (`ToInt32(a) << (ToInt32(b) & 31)`).
+pub const OP_SHL: u32 = 52;
+/// 32-bit signed right shift (arithmetic).
+pub const OP_SHR: u32 = 53;
+/// 32-bit unsigned right shift (`u32`, result is the unsigned value).
+pub const OP_USHR: u32 = 54;
+/// 32-bit bitwise NOT.
+pub const OP_BIT_NOT: u32 = 55;
+/// Pops a key and a receiver; pushes whether the key is a property of the
+/// receiver (`key in receiver`). Non-object receivers throw TypeError.
+pub const OP_IN: u32 = 56;
+/// Pops a key and a receiver; deletes the property and pushes `true`
+/// (configurability is not modeled yet). Non-object receivers throw
+/// TypeError.
+pub const OP_DELETE: u32 = 57;
+/// Pops a receiver; pushes its keys as an array of values (object keys,
+/// array indices as strings) for `for-in`.
+pub const OP_KEYS: u32 = 58;
+/// Constructor call: pops `operand` args and the callee; creates a fresh
+/// object, binds it as the callee's `this`, enters the body, and — following
+/// JS constructor semantics — uses the fresh object as the result unless the
+/// callee returns an object of its own.
+pub const OP_NEW: u32 = 60;
+/// Pushes global `operand` (a string-pool name): the global property value,
+/// or a ReferenceError throw when absent.
+pub const OP_GLOBAL_GET: u32 = 61;
+/// Pops a value; assigns it to global `operand` (a string-pool name) and
+/// pushes it back (sloppy-mode global creation).
+pub const OP_GLOBAL_SET: u32 = 62;
 
 /// Canonical tag order mirrored by `zig/src/abi.zig` for conformance probes.
 /// New tags are appended at the end so existing indices stay stable.
@@ -212,6 +256,21 @@ pub const CONFORMANCE_OPS: &[u32] = &[
     OP_TRY_ENTER,
     OP_TRY_EXIT,
     OP_THROW,
+    OP_THIS,
+    OP_TYPEOF,
+    OP_BIT_AND,
+    OP_BIT_OR,
+    OP_BIT_XOR,
+    OP_SHL,
+    OP_SHR,
+    OP_USHR,
+    OP_BIT_NOT,
+    OP_IN,
+    OP_DELETE,
+    OP_KEYS,
+    OP_NEW,
+    OP_GLOBAL_GET,
+    OP_GLOBAL_SET,
 ];
 
 #[repr(C)]
@@ -635,6 +694,111 @@ impl Instruction {
         }
     }
 
+    pub const fn this_() -> Self {
+        Self {
+            op: OP_THIS,
+            operand: 0,
+        }
+    }
+
+    pub const fn typeof_() -> Self {
+        Self {
+            op: OP_TYPEOF,
+            operand: 0,
+        }
+    }
+
+    pub const fn bit_and() -> Self {
+        Self {
+            op: OP_BIT_AND,
+            operand: 0,
+        }
+    }
+
+    pub const fn bit_or() -> Self {
+        Self {
+            op: OP_BIT_OR,
+            operand: 0,
+        }
+    }
+
+    pub const fn bit_xor() -> Self {
+        Self {
+            op: OP_BIT_XOR,
+            operand: 0,
+        }
+    }
+
+    pub const fn shl() -> Self {
+        Self {
+            op: OP_SHL,
+            operand: 0,
+        }
+    }
+
+    pub const fn shr() -> Self {
+        Self {
+            op: OP_SHR,
+            operand: 0,
+        }
+    }
+
+    pub const fn ushr() -> Self {
+        Self {
+            op: OP_USHR,
+            operand: 0,
+        }
+    }
+
+    pub const fn bit_not() -> Self {
+        Self {
+            op: OP_BIT_NOT,
+            operand: 0,
+        }
+    }
+
+    pub const fn in_() -> Self {
+        Self {
+            op: OP_IN,
+            operand: 0,
+        }
+    }
+
+    pub const fn delete() -> Self {
+        Self {
+            op: OP_DELETE,
+            operand: 0,
+        }
+    }
+
+    pub const fn keys() -> Self {
+        Self {
+            op: OP_KEYS,
+            operand: 0,
+        }
+    }
+
+    pub const fn new_(arg_count: usize) -> Self {
+        Self {
+            op: OP_NEW,
+            operand: arg_count as i32,
+        }
+    }
+
+    pub const fn global_get(name: usize) -> Self {
+        Self {
+            op: OP_GLOBAL_GET,
+            operand: name as i32,
+        }
+    }
+
+    pub const fn global_set(name: usize) -> Self {
+        Self {
+            op: OP_GLOBAL_SET,
+            operand: name as i32,
+        }
+    }
+
     pub const fn print() -> Self {
         Self {
             op: OP_PRINT,
@@ -893,6 +1057,21 @@ mod tests {
             OP_TRY_ENTER,
             OP_TRY_EXIT,
             OP_THROW,
+            OP_THIS,
+            OP_TYPEOF,
+            OP_BIT_AND,
+            OP_BIT_OR,
+            OP_BIT_XOR,
+            OP_SHL,
+            OP_SHR,
+            OP_USHR,
+            OP_BIT_NOT,
+            OP_IN,
+            OP_DELETE,
+            OP_KEYS,
+            OP_NEW,
+            OP_GLOBAL_GET,
+            OP_GLOBAL_SET,
         ];
         for op in ops {
             assert!(

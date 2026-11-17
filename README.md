@@ -12,19 +12,17 @@ tier) without porting any of its code.
 
 ## Status
 
-Phase 5: arrays and objects. On top of expressions, statements, functions,
-closures, and strings, R8 now has **first-class arrays and objects**: array
-literals (with holes), object literals (identifier/string/computed keys,
-shorthand), property access (`a.b` compiles to `a["b"]`, one GetV opcode
-with JS semantics), element/property assignment (arrays grow with
-`undefined` fill), string indexing and `.length`, reference equality,
-and the built-in array methods **`.map`** (which re-enters the interpreter
-to run callbacks) and **`.join`**. `console.log` prints arrays JS-style.
+Wave A2 complete: the engine now runs `this` (per-run global object),
+`typeof`, the ternary `?:`, the full 32-bit bitwise/shift set (`& | ^ ~
+<< >> >>>` with compound assignments), `in`, `delete`, `do-while`, `switch`
+(with fall-through and `break`), `break`/`continue`, `for-in` over object
+keys, `new` constructor calls (JS result protocol: object return wins,
+otherwise the fresh object), hashbang comments, `\uXXXX` identifier escapes,
+block comments, and sloppy-mode global variable semantics (assignment
+creates globals; reads of missing globals throw `ReferenceError`).
 
-All three smoke fixtures now pass:
-`arith.js`, `strings.js`, and `array.js`.
-
-Not yet: prototypes, getters/setters, `for`-of/`for`-in (see the roadmap).
+Not yet: `class`, generators, destructuring, getters, `instanceof`,
+labels (see the roadmap and the conformance scoreboard).
 
 ## Usage
 
@@ -156,11 +154,12 @@ zig test zig/src/root.zig
 | 4 ✅ | functions, calls, closures | — |
 | 5 ✅ | arrays, objects, property access, `.map`/`.join` | `tests/smoke/array.js` |
 | 6 ✅ | errors-as-values, `try`/`catch`/`throw` | Test262 gates (CI) |
-| 7 | Test262 scoreboard growth + runtime architecture (GC, isolates) | Test262 rates ↑ |
-| 8 | `r8-dom` + bindings (the Blink layer begins) | WPT `dom/` |
-| 9 | `r8-html`, `r8-css`, `r8-style` | WPT `html/syntax`, cssom |
-| 10 | `r8-layout` + `r8-paint` (CPU + GPU) | layout reftests, PNG snapshots |
-| 11 | `r8-shell` event loop + `r8-wpt` runner | WPT `html/` rates |
+| 7 ✅ | wave A2: `typeof`/`?:`/bitwise/`this`/`new`/`switch`/`for-in`/`break`/`continue` | Test262 gates ↑ (types 18→50) |
+| 8 | language wave A3 + runtime architecture (GC, isolates) | Test262 rates ↑ |
+| 9 | `r8-dom` + bindings (the Blink layer begins) | WPT `dom/` |
+| 10 | `r8-html`, `r8-css`, `r8-style` | WPT `html/syntax`, cssom |
+| 11 | `r8-layout` + `r8-paint` (CPU + GPU) | layout reftests, PNG snapshots |
+| 12 | `r8-shell` event loop + `r8-wpt` runner | WPT `html/` rates |
 
 ## License
 

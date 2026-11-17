@@ -110,6 +110,12 @@ const Frame = struct {
     /// The running function's object (holds its upvalue cells); null for
     /// the main frame.
     function: ?*FunctionObject,
+    /// `this` for the frame: the global object for normal calls, the fresh
+    /// object for constructor calls.
+    this_value: ?abi.Value,
+    /// Constructor-call target: on RETURN, a non-object result is replaced
+    /// with this value (JS constructor semantics).
+    new_target: ?abi.Value,
 };
 
 /// An active try block: where to catch, and the state to restore.
@@ -177,6 +183,8 @@ pub const Machine = struct {
     /// Set when a throw crossed call frames, aborting in-flight builtin
     /// loops; reset by `invoke`.
     escaped: bool = false,
+    /// `this` for sloppy-mode global code: a fresh object per run.
+    global_object: abi.Value = abi.Value.UNDEF,
     code: []const abi.Instruction,
     pool: []const abi.Value,
     functions: []const abi.KeelFunction,
@@ -202,6 +210,8 @@ pub const Machine = struct {
             .stack_base = 0,
             .locals_base = 0,
             .function = null,
+            .this_value = null,
+            .new_target = null,
         };
         machine.fp = 1;
         return machine;
@@ -513,15 +523,22 @@ pub const Machine = struct {
                 }
                 self.stack.push(fn_value);
                 for (0..arg_count) |i| self.stack.push(args[i]);
-                self.performCall(arg_count);
+                self.performCall(arg_count, null);
             },
 
             abi.OP_RETURN => {
                 const frame = self.frames[self.fp - 1];
-                const value = if (self.stack.sp > frame.stack_base)
+                var value = if (self.stack.sp > frame.stack_base)
                     self.stack.pop()
                 else
                     abi.Value.UNDEF;
+                // Constructor-call protocol: a non-object return keeps the
+                // freshly constructed object.
+                if (frame.new_target) |constructed| {
+                    if (value.tag != abi.TAG_OBJECT) {
+                        value = constructed;
+                    }
+                }
                 self.fp -= 1;
                 self.stack.sp = frame.stack_base;
                 self.locals_top = frame.locals_base;
@@ -533,6 +550,26 @@ pub const Machine = struct {
                 if (self.fp == 0) return value; // returned from the main frame
                 self.pc = frame.return_pc;
                 self.stack.push(value);
+            },
+            abi.OP_NEW => {
+                const arg_count: usize = @intCast(instruction.operand);
+                if (arg_count > MAX_ARGS) @panic("too many arguments");
+                if (self.stack.sp < arg_count + 1) @panic("stack underflow in constructor call");
+                var args: [MAX_ARGS]abi.Value = undefined;
+                for (0..arg_count) |i| args[i] = self.stack.values[self.stack.sp - arg_count + i];
+                const fn_value = self.stack.values[self.stack.sp - arg_count - 1];
+                self.stack.sp -= arg_count + 1;
+                if (fn_value.tag != abi.TAG_FUNCTION) {
+                    if (self.throwMessage("TypeError: not a constructor")) |result| {
+                        return result;
+                    }
+                    return null;
+                }
+                self.stack.push(fn_value);
+                for (0..arg_count) |i| self.stack.push(args[i]);
+                const constructed = allocObject(&[_]abi.Value{}, &[_]abi.Value{});
+                self.performCall(arg_count, constructed);
+                self.frames[self.fp - 1].new_target = constructed;
             },
             abi.OP_TRY_ENTER => {
                 if (self.hp >= MAX_HANDLERS) @panic("too many nested try blocks");
@@ -552,6 +589,105 @@ pub const Machine = struct {
                 const thrown = self.stack.pop();
                 if (self.throwValue(thrown)) |result| return result;
             },
+            abi.OP_THIS => {
+                const this = self.frames[self.fp - 1].this_value;
+                self.stack.push(this orelse self.global_object);
+            },
+            abi.OP_TYPEOF => {
+                const value = self.stack.pop();
+                const name: []const u8 = switch (value.tag) {
+                    abi.TAG_INT, abi.TAG_FLOAT => "number",
+                    abi.TAG_STRING => "string",
+                    abi.TAG_BOOL => "boolean",
+                    abi.TAG_UNDEFINED => "undefined",
+                    abi.TAG_FUNCTION, abi.TAG_METHOD => "function",
+                    // JS quirk: `typeof null` is "object".
+                    else => "object",
+                };
+                self.stack.push(allocString(name));
+            },
+            abi.OP_BIT_AND, abi.OP_BIT_OR, abi.OP_BIT_XOR, abi.OP_SHL, abi.OP_SHR, abi.OP_USHR => {
+                const right = self.stack.pop();
+                const left = self.stack.pop();
+                const a = toInt32(left.toNumber());
+                const b = toInt32(right.toNumber());
+                const shift: u5 = @intCast(@as(u32, @bitCast(b)) & 31);
+                switch (instruction.op) {
+                    abi.OP_BIT_AND => self.stack.push(abi.Value.fromInt(a & b)),
+                    abi.OP_BIT_OR => self.stack.push(abi.Value.fromInt(a | b)),
+                    abi.OP_BIT_XOR => self.stack.push(abi.Value.fromInt(a ^ b)),
+                    abi.OP_SHL => self.stack.push(abi.Value.fromInt(a << shift)),
+                    abi.OP_SHR => self.stack.push(abi.Value.fromInt(a >> shift)),
+                    abi.OP_USHR => {
+                        const unsigned: u32 = @bitCast(a);
+                        self.stack.push(abi.Value.fromInt(@as(i64, unsigned >> shift)));
+                    },
+                    else => unreachable,
+                }
+            },
+            abi.OP_BIT_NOT => {
+                const value = self.stack.pop();
+                self.stack.push(abi.Value.fromInt(~toInt32(value.toNumber())));
+            },
+            abi.OP_IN => {
+                const receiver = self.stack.pop();
+                const key = self.stack.pop();
+                if (receiver.tag == abi.TAG_NULL or receiver.tag == abi.TAG_UNDEFINED) {
+                    if (self.throwMessage("TypeError: cannot use 'in' on null or undefined")) |result| {
+                        return result;
+                    }
+                    return null;
+                }
+                self.stack.push(abi.Value.fromBool(hasProperty(receiver, key)));
+            },
+            abi.OP_DELETE => {
+                const key = self.stack.pop();
+                const receiver = self.stack.pop();
+                if (receiver.tag == abi.TAG_NULL or receiver.tag == abi.TAG_UNDEFINED) {
+                    if (self.throwMessage("TypeError: cannot delete from null or undefined")) |result| {
+                        return result;
+                    }
+                    return null;
+                }
+                self.stack.push(abi.Value.fromBool(deleteProperty(receiver, key)));
+            },
+            abi.OP_KEYS => {
+                const receiver = self.stack.pop();
+                self.stack.push(ownKeys(receiver));
+            },
+            abi.OP_GLOBAL_GET => {
+                const index: usize = @intCast(instruction.operand);
+                if (index >= self.pool.len) @panic("string pool out of range");
+                const name_value = self.pool[index];
+                if (name_value.tag != abi.TAG_STRING) @panic("global name is not a string");
+                const name = name_value.asString().?;
+                const key = allocString(name);
+                const object = self.global_object.asObject().?;
+                if (findKey(object, key)) |slot| {
+                    self.stack.push(object.values[slot]);
+                } else {
+                    var text: [128]u8 = undefined;
+                    const message = std.fmt.bufPrint(
+                        &text,
+                        "ReferenceError: {s} is not defined",
+                        .{name},
+                    ) catch "ReferenceError: identifier is not defined";
+                    if (self.throwMessage(message)) |result| {
+                        return result;
+                    }
+                    return null;
+                }
+            },
+            abi.OP_GLOBAL_SET => {
+                const index: usize = @intCast(instruction.operand);
+                if (index >= self.pool.len) @panic("string pool out of range");
+                const name_value = self.pool[index];
+                const value = self.stack.pop();
+                const key = allocString(name_value.asString().?);
+                const receiver = self.global_object;
+                setIndex(receiver, key, value);
+                self.stack.push(value);
+            },
             else => @panic("unknown opcode"),
         }
         return null;
@@ -559,7 +695,8 @@ pub const Machine = struct {
 
     /// Shared call mechanics: the stack holds `[fn, arg1..argN]` with
     /// `arg_count` arguments; pops them, pushes a frame, and enters the body.
-    fn performCall(self: *Machine, arg_count: usize) void {
+    /// `this_override` replaces the default (global) `this` for the frame.
+    fn performCall(self: *Machine, arg_count: usize, this_override: ?abi.Value) void {
         if (self.stack.sp < arg_count + 1) @panic("stack underflow in call");
         const fn_value = self.stack.values[self.stack.sp - arg_count - 1];
         if (fn_value.tag != abi.TAG_FUNCTION) @panic("call of a non-function value");
@@ -581,6 +718,8 @@ pub const Machine = struct {
             .stack_base = self.stack.sp,
             .locals_base = base,
             .function = fo,
+            .this_value = this_override orelse self.global_object,
+            .new_target = null,
         };
         self.fp += 1;
         self.pc = entry.start;
@@ -597,7 +736,7 @@ pub const Machine = struct {
         self.escaped = false;
         self.stack.push(callee);
         for (args) |arg| self.stack.push(arg);
-        self.performCall(args.len);
+        self.performCall(args.len, null);
         while (self.fp > target_fp) {
             if (self.step()) |_| return null; // uncaught inside the callback
         }
@@ -679,6 +818,9 @@ fn runOutcome(
     defer releaseMachine();
     resetArena();
     var machine = Machine.init(instructions, pool, functions);
+    // `this` in sloppy-mode global code: a fresh object per run. Created
+    // after the arena reset so it lives in this run's arena.
+    machine.global_object = allocObject(&[_]abi.Value{}, &[_]abi.Value{});
     const value = machine.execute();
     return .{ .value = value, .thrown = machine.thrown };
 }
@@ -1052,6 +1194,140 @@ fn builtinByName(name: []const u8) ?Builtin {
     if (std.mem.eql(u8, name, "map")) return .map;
     if (std.mem.eql(u8, name, "join")) return .join;
     return null;
+}
+
+/// ES ToInt32: NaN and infinities become 0; the value is reduced modulo
+/// 2^32 and wrapped to a signed 32-bit integer.
+fn toInt32(f: f64) i32 {
+    if (std.math.isNan(f) or std.math.isInf(f)) return 0;
+    const truncated = @trunc(f);
+    if (truncated == 0.0) return 0;
+    // Reduce modulo 2^32 via f64 arithmetic (exact for |t| < 2^53; larger
+    // magnitudes lose precision the same way JS engines with f64 reducers
+    // historically did — accepted for now).
+    const reduced = @rem(truncated, 4294967296.0);
+    const as_i64: i64 = @intFromFloat(reduced);
+    return @truncate(as_i64);
+}
+
+/// JS `key in receiver` over the value kinds that exist so far.
+fn hasProperty(receiver: abi.Value, key: abi.Value) bool {
+    switch (receiver.tag) {
+        abi.TAG_OBJECT => {
+            const object = receiver.asObject().?;
+            return findKey(object, key) != null;
+        },
+        abi.TAG_ARRAY => {
+            const array = receiver.asArray().?;
+            if (key.tag == abi.TAG_INT) {
+                return key.payload >= 0 and key.payload < @as(i64, @intCast(array.len));
+            }
+            if (key.tag == abi.TAG_STRING) {
+                const name = key.asString().?;
+                if (std.mem.eql(u8, name, "length")) return true;
+                return builtinByName(name) != null;
+            }
+            return false;
+        },
+        abi.TAG_STRING => {
+            const bytes = receiver.asString().?;
+            if (key.tag == abi.TAG_INT) {
+                return key.payload >= 0 and key.payload < @as(i64, @intCast(charCount(bytes)));
+            }
+            if (key.tag == abi.TAG_STRING) {
+                return std.mem.eql(u8, key.asString().?, "length");
+            }
+            return false;
+        },
+        abi.TAG_FUNCTION => {
+            // length/name/prototype stand-ins.
+            if (key.tag != abi.TAG_STRING) return false;
+            const name = key.asString().?;
+            return std.mem.eql(u8, name, "length") or
+                std.mem.eql(u8, name, "name") or
+                std.mem.eql(u8, name, "prototype");
+        },
+        abi.TAG_NULL, abi.TAG_UNDEFINED => {
+            // Callers convert this to a TypeError throw via the stack-peek
+            // protocol; `hasProperty` itself only sees valid receivers.
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn findKey(object: *abi.KeelObject, key: abi.Value) ?usize {
+    if (key.tag != abi.TAG_STRING) return null;
+    const name = key.asString().?;
+    const keys = object.keys[0..object.len];
+    for (keys, 0..) |property_key, i| {
+        if (property_key.tag == abi.TAG_STRING and
+            std.mem.eql(u8, property_key.asString().?, name))
+        {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// JS `delete receiver[key]`. Always true in this phase (configurability is
+/// not modeled); arrays get an `undefined` hole (join already renders it).
+fn deleteProperty(receiver: abi.Value, key: abi.Value) bool {
+    switch (receiver.tag) {
+        abi.TAG_OBJECT => {
+            const object = receiver.asObject().?;
+            const index = findKey(object, key) orelse return true;
+            const allocator = machineAllocator();
+            const keys = allocator.alloc(abi.Value, object.len - 1) catch @panic("out of memory");
+            const values = allocator.alloc(abi.Value, object.len - 1) catch @panic("out of memory");
+            var w: usize = 0;
+            for (0..object.len) |i| {
+                if (i == index) continue;
+                keys[w] = object.keys[i];
+                values[w] = object.values[i];
+                w += 1;
+            }
+            object.keys = keys.ptr;
+            object.values = values.ptr;
+            object.len -= 1;
+            return true;
+        },
+        abi.TAG_ARRAY => {
+            const array = receiver.asArray().?;
+            if (key.tag == abi.TAG_INT and
+                key.payload >= 0 and key.payload < @as(i64, @intCast(array.len)))
+            {
+                array.items[@intCast(key.payload)] = abi.Value.UNDEF;
+            }
+            return true;
+        },
+        else => return true,
+    }
+}
+
+/// Own enumerable-ish keys for `for-in`: object keys, array indices as
+/// strings. Null/undefined return an empty array (the loop just doesn't run;
+/// a strict TypeError model arrives with the error-object work).
+fn ownKeys(receiver: abi.Value) abi.Value {
+    switch (receiver.tag) {
+        abi.TAG_OBJECT => {
+            const object = receiver.asObject().?;
+            const keys = machineAllocator().alloc(abi.Value, object.len) catch @panic("out of memory");
+            for (0..object.len) |i| keys[i] = object.keys[i];
+            return allocArray(keys);
+        },
+        abi.TAG_ARRAY => {
+            const array = receiver.asArray().?;
+            const keys = machineAllocator().alloc(abi.Value, array.len) catch @panic("out of memory");
+            var buffer: [32]u8 = undefined;
+            for (0..array.len) |i| {
+                const text = std.fmt.bufPrint(&buffer, "{d}", .{i}) catch unreachable;
+                keys[i] = allocString(text);
+            }
+            return allocArray(keys);
+        },
+        else => return allocArray(&[_]abi.Value{}),
+    }
 }
 
 fn charCount(bytes: []const u8) usize {

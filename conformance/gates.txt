@@ -4,18 +4,20 @@
 # engine grows, and never lower them.
 # Format: <suite-prefix> <min-pass-rate-percent>
 
-language/types 18
-language/literals 61
-language/identifiers 45
-language/asi 50
-language/comments 66
-language/white-space 16
-language/punctuators 90
-language/directive-prologue 29
-language/reserved-words 53
-language/keywords 100
-language/future-reserved-words 87
-language/line-terminators 73
+language/types 49
+language/literals 71
+language/identifiers 49
+language/asi 67
+language/comments 67
+language/white-space 39
+language/punctuators 89
+language/directive-prologue 49
+language/reserved-words 52
+language/keywords 99
+language/future-reserved-words 99
+language/line-terminators 77
 language/source-text 0
-language/statementList 15
-language/block-scope 85
+language/statementList 14
+language/block-scope 86
+language/expressions 29
+language/statements 25

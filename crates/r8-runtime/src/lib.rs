@@ -4,7 +4,14 @@ use r8_abi::Value;
 use r8_front::{
     CompileError, Compiled, ParseError, compile, compile_program, parse, parse_program,
 };
+use std::sync::Mutex;
 use thiserror::Error;
+
+/// Returned string/function values point into the machine's arena, which the
+/// next run resets — so concurrent evals must not interleave with consumers
+/// of a previous run's results. Test code (and embedders holding values
+/// across calls) should serialize on this.
+pub static MACHINE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Error)]
 pub enum EvalError {
@@ -66,18 +73,21 @@ mod tests {
 
     #[test]
     fn evaluates_addition() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval_i64("1+1").unwrap(), 2);
         assert_eq!(eval_i64("2+3+4").unwrap(), 9);
     }
 
     #[test]
     fn reports_parse_errors() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert!(eval_i64("1@1").is_err());
         assert!(eval_i64("name").is_err());
     }
 
     #[test]
     fn evaluates_expressions() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval("2**10").unwrap().to_string(), "1024");
         assert_eq!(eval("1/2").unwrap().to_string(), "0.5");
         assert_eq!(eval("1/0").unwrap().to_string(), "Infinity");
@@ -93,6 +103,7 @@ mod tests {
 
     #[test]
     fn evaluates_programs() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval_program("1; 2; 3").unwrap().to_string(), "3");
         // The final console.log leaves `undefined`, matching JS.
         assert_eq!(
@@ -104,6 +115,7 @@ mod tests {
 
     #[test]
     fn evaluates_variables_and_loops() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(
             eval_program("let i = 0; let total = 0; while (i < 5) { total += i; i += 1; } total")
                 .unwrap()
@@ -157,16 +169,20 @@ mod tests {
 
     #[test]
     fn reports_compile_errors() {
-        assert!(matches!(
-            eval("x").unwrap_err(),
-            EvalError::Compile(r8_front::CompileError::Undeclared(_))
-        ));
+        let _machine_guard = MACHINE_LOCK.lock();
+        // Undeclared reads compile to global fallback now; the runtime
+        // surfaces a ReferenceError for missing globals.
+        assert_eq!(
+            eval("x").unwrap_err().to_string(),
+            "uncaught ReferenceError: x is not defined"
+        );
         assert!(eval_program("const x = 1; x = 2;").is_err());
         assert!(eval_program("let x = x;").is_err());
     }
 
     #[test]
     fn evaluates_strings() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval("'a' + 'b'").unwrap().to_string(), "ab");
         assert_eq!(eval("'a' + 5").unwrap().to_string(), "a5");
         assert_eq!(eval("5 + ''").unwrap().to_string(), "5");
@@ -186,6 +202,7 @@ mod tests {
 
     #[test]
     fn evaluates_templates() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval("`hello ${'r8'}`").unwrap().to_string(), "hello r8");
         assert_eq!(eval("`x${1 + 1}y`").unwrap().to_string(), "x2y");
         // Numeric substitutions stringify correctly, never add numerically.
@@ -205,6 +222,7 @@ mod tests {
 
     #[test]
     fn evaluates_functions_and_calls() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(
             eval_program("function add(a, b) { return a + b; } add(2, 3)")
                 .unwrap()
@@ -242,6 +260,7 @@ mod tests {
 
     #[test]
     fn evaluates_closures() {
+        let _machine_guard = MACHINE_LOCK.lock();
         // Captured variables share mutation.
         assert_eq!(
             eval_program("let c = 0; const inc = () => { c += 1; }; inc(); inc(); c")
@@ -274,6 +293,7 @@ mod tests {
 
     #[test]
     fn evaluates_recursion_and_higher_order() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(
             eval_program(
                 "function fact(n) { if (n <= 1) { return 1; } return n * fact(n - 1); } fact(5)"
@@ -300,6 +320,7 @@ mod tests {
 
     #[test]
     fn follows_js_call_semantics() {
+        let _machine_guard = MACHINE_LOCK.lock();
         // Missing arguments read as undefined; extras are ignored.
         assert_eq!(
             eval_program("function g(a, b) { return b; } g(1)")
@@ -331,6 +352,7 @@ mod tests {
 
     #[test]
     fn string_values_survive_across_runs() {
+        let _machine_guard = MACHINE_LOCK.lock();
         // A string returned by one run stays readable until the next run
         // resets the machine's arena (documented lifetime).
         let first = eval("'kept'").unwrap();
@@ -343,6 +365,7 @@ mod tests {
 
     #[test]
     fn machine_conformance_probes_agree() {
+        let _machine_guard = MACHINE_LOCK.lock();
         // The Zig machine mirrors every tag and opcode constant, in the same
         // canonical order; walk both tables across the FFI boundary.
         assert_eq!(
@@ -374,6 +397,7 @@ mod exception_tests {
 
     #[test]
     fn evaluates_exceptions() {
+        let _machine_guard = MACHINE_LOCK.lock();
         // try/catch with a binding.
         assert_eq!(
             eval_program("try { throw 7; } catch (e) { e }")
@@ -448,6 +472,7 @@ mod phase5_tests {
 
     #[test]
     fn evaluates_arrays() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval("[1, 2, 3]").unwrap().to_string(), "1,2,3");
         assert_eq!(eval("[1, 2, 3][1]").unwrap().to_string(), "2");
         assert_eq!(eval("[1, 2, 3].length").unwrap().to_string(), "3");
@@ -477,6 +502,7 @@ mod phase5_tests {
 
     #[test]
     fn evaluates_objects() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval("({ a: 1 }).a").unwrap().to_string(), "1");
         assert_eq!(eval("({ a: 1 })['a']").unwrap().to_string(), "1");
         assert_eq!(eval("({ a: 1 }).missing").unwrap().to_string(), "undefined");
@@ -518,7 +544,8 @@ mod phase5_tests {
             "true"
         );
         // Arrays are truthy even when empty; String({}) is "[object Object]".
-        assert!(eval("[] ? 1 : 0").is_err()); // no ternary yet
+        // The ternary works now (Wave A2).
+        assert_eq!(eval("[] ? 1 : 0").unwrap().to_string(), "1");
         assert_eq!(
             eval_program("let x = 0; if ([]) { x = 1; } else { x = 0; } x")
                 .unwrap()
@@ -531,6 +558,7 @@ mod phase5_tests {
 
     #[test]
     fn evaluates_strings_as_objects() {
+        let _machine_guard = MACHINE_LOCK.lock();
         assert_eq!(eval("'hello'.length").unwrap().to_string(), "5");
         assert_eq!(eval("'héllo'.length").unwrap().to_string(), "5");
         assert_eq!(eval("'hello'[1]").unwrap().to_string(), "e");
@@ -539,6 +567,7 @@ mod phase5_tests {
 
     #[test]
     fn evaluates_array_builtins() {
+        let _machine_guard = MACHINE_LOCK.lock();
         // map re-enters the interpreter for each element.
         assert_eq!(
             eval("[1, 2, 3].map((value) => value * 2)")
