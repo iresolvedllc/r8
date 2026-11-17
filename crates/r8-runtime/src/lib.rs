@@ -360,3 +360,130 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod phase5_tests {
+    use super::*;
+
+    #[test]
+    fn evaluates_arrays() {
+        assert_eq!(eval("[1, 2, 3]").unwrap().to_string(), "1,2,3");
+        assert_eq!(eval("[1, 2, 3][1]").unwrap().to_string(), "2");
+        assert_eq!(eval("[1, 2, 3].length").unwrap().to_string(), "3");
+        assert_eq!(eval("[1,,3]").unwrap().to_string(), "1,,3");
+        assert_eq!(eval("[1, 2, 3][9]").unwrap().to_string(), "undefined");
+        assert_eq!(eval("[]").unwrap().to_string(), "");
+        // Element assignment grows with undefined fill.
+        assert_eq!(
+            eval_program("let a = []; a[2] = 7; a[2]")
+                .unwrap()
+                .to_string(),
+            "7"
+        );
+        assert_eq!(
+            eval_program("let a = []; a[2] = 7; a.length")
+                .unwrap()
+                .to_string(),
+            "3"
+        );
+        assert_eq!(
+            eval_program("let a = []; a[2] = 7; a[1]")
+                .unwrap()
+                .to_string(),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn evaluates_objects() {
+        assert_eq!(eval("({ a: 1 }).a").unwrap().to_string(), "1");
+        assert_eq!(eval("({ a: 1 })['a']").unwrap().to_string(), "1");
+        assert_eq!(eval("({ a: 1 }).missing").unwrap().to_string(), "undefined");
+        // Unknown properties read as undefined; arrays expose builtins.
+        assert_eq!(eval("({}).toString").unwrap().to_string(), "undefined");
+        assert_eq!(eval("[].map").unwrap().tag, r8_abi::TAG_METHOD);
+        // Shorthand and computed keys.
+        assert_eq!(
+            eval_program("let k = 'b'; let a = 5; let o = { a, [k]: 7 }; o.b")
+                .unwrap()
+                .to_string(),
+            "7"
+        );
+        // Property assignment adds and overwrites.
+        assert_eq!(
+            eval_program("let o = { a: 1 }; o.a = 2; o.b = 3; o.a")
+                .unwrap()
+                .to_string(),
+            "2"
+        );
+        // Compound property assignment.
+        assert_eq!(
+            eval_program("let o = { n: 10 }; o.n += 5; o.n")
+                .unwrap()
+                .to_string(),
+            "15"
+        );
+        // Compound index assignment on arrays.
+        assert_eq!(
+            eval_program("let a = [1, 2]; a[1] += 10; a[1]")
+                .unwrap()
+                .to_string(),
+            "12"
+        );
+        // Reference equality, JS-style.
+        assert_eq!(eval("[] === []").unwrap().to_string(), "false");
+        assert_eq!(
+            eval_program("let a = []; a === a").unwrap().to_string(),
+            "true"
+        );
+        // Arrays are truthy even when empty; String({}) is "[object Object]".
+        assert!(eval("[] ? 1 : 0").is_err()); // no ternary yet
+        assert_eq!(
+            eval_program("let x = 0; if ([]) { x = 1; } else { x = 0; } x")
+                .unwrap()
+                .to_string(),
+            "1"
+        );
+        assert_eq!(eval("'' + []").unwrap().to_string(), "");
+        assert_eq!(eval("'' + {}").unwrap().to_string(), "[object Object]");
+    }
+
+    #[test]
+    fn evaluates_strings_as_objects() {
+        assert_eq!(eval("'hello'.length").unwrap().to_string(), "5");
+        assert_eq!(eval("'héllo'.length").unwrap().to_string(), "5");
+        assert_eq!(eval("'hello'[1]").unwrap().to_string(), "e");
+        assert_eq!(eval("'hello'[9]").unwrap().to_string(), "undefined");
+    }
+
+    #[test]
+    fn evaluates_array_builtins() {
+        // map re-enters the interpreter for each element.
+        assert_eq!(
+            eval("[1, 2, 3].map((value) => value * 2)")
+                .unwrap()
+                .to_string(),
+            "2,4,6"
+        );
+        assert_eq!(
+            eval("[1, 2, 3].map((value) => value * 2).join(',')")
+                .unwrap()
+                .to_string(),
+            "2,4,6"
+        );
+        // join with default and custom separators; null/undefined render "".
+        assert_eq!(eval("[1, 2, 3].join('-')").unwrap().to_string(), "1-2-3");
+        assert_eq!(
+            eval("[undefined, 2, null].join(',')").unwrap().to_string(),
+            ",2,"
+        );
+        assert_eq!(eval("[1, 2, 3].join()").unwrap().to_string(), "1,2,3");
+        // map receives (element, index, array).
+        assert_eq!(
+            eval("[10, 20].map((value, index) => value + index)")
+                .unwrap()
+                .to_string(),
+            "10,21"
+        );
+    }
+}

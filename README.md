@@ -12,15 +12,19 @@ tier) without porting any of its code.
 
 ## Status
 
-Phase 4: functions. R8 now has the full statement and expression language
-plus **functions and closures**: `function` declarations, anonymous function
-expressions, arrow functions (including paren-free single parameters),
-`return`, calls (first-class function values, currying, higher-order
-functions), and JS-correct closure semantics — captured variables are
-heap-allocated cells, so mutations are shared and closures outlive their
-frames (counters, recursion through self-capture).
+Phase 5: arrays and objects. On top of expressions, statements, functions,
+closures, and strings, R8 now has **first-class arrays and objects**: array
+literals (with holes), object literals (identifier/string/computed keys,
+shorthand), property access (`a.b` compiles to `a["b"]`, one GetV opcode
+with JS semantics), element/property assignment (arrays grow with
+`undefined` fill), string indexing and `.length`, reference equality,
+and the built-in array methods **`.map`** (which re-enters the interpreter
+to run callbacks) and **`.join`**. `console.log` prints arrays JS-style.
 
-Not yet: objects/arrays (see the roadmap).
+All three smoke fixtures now pass:
+`arith.js`, `strings.js`, and `array.js`.
+
+Not yet: prototypes, getters/setters, `for`-of/`for`-in (see the roadmap).
 
 ## Usage
 
@@ -31,7 +35,8 @@ cargo run -p r8-cli -- eval "1 / 0"          # Infinity
 cargo run -p r8-cli -- eval "'a' + 5"        # a5
 cargo run -p r8-cli -- eval "`x${1 + 1}y`"   # x2y
 cargo run -p r8-cli -- eval "((f, x) => f(f(x)))((v) => v * v, 3)"  # 81
-cargo run -p r8-cli -- run tests/smoke/strings.js
+cargo run -p r8-cli -- eval "[1, 2, 3].map((v) => v * 2).join('-')" # 2-4-6
+cargo run -p r8-cli -- run tests/smoke/array.js
 cargo run -p r8-cli -- selftest              # runtime ABI + eval smoke test
 ```
 
@@ -119,7 +124,7 @@ zig test zig/src/root.zig
 | 2 ✅ | variables, assignment, control flow, `&&`/`\|\|` | — |
 | 3 ✅ | strings, template literals, string semantics | `tests/smoke/strings.js` |
 | 4 ✅ | functions, calls, closures | — |
-| 5 | arrays, objects, property access | `tests/smoke/array.js` |
+| 5 ✅ | arrays, objects, property access, `.map`/`.join` | `tests/smoke/array.js` |
 | 6 | isolate/allocator wiring, GC, baseline tier, IR | — |
 
 ## License

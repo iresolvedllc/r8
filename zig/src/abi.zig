@@ -1,11 +1,13 @@
 //! ABI version note: this file hand-mirrors `crates/r8-abi`. ABI v2 added
 //! doubles/booleans/print; ABI v3 added locals, DUP, and jumps; ABI v4 adds
 //! strings (TAG_STRING, constant pool, LOAD_STRING/TO_STRING); ABI v5 adds
-//! functions (TAG_FUNCTION, function table, closure/capture opcodes).
+//! functions (TAG_FUNCTION, function table, closure/capture opcodes); ABI v6
+//! adds arrays and objects (TAG_ARRAY, TAG_OBJECT, TAG_METHOD, property
+//! access).
 
 const std = @import("std");
 
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// Value tags. Mirrors `crates/r8-abi`'s constants; the `CONFORMANCE_TAGS`
 /// table below lists them in the same canonical order — keep both in sync.
@@ -17,6 +19,8 @@ pub const TAG_NULL: u32 = 5;
 pub const TAG_UNDEFINED: u32 = 6;
 pub const TAG_STRING: u32 = 7;
 pub const TAG_FUNCTION: u32 = 8;
+pub const TAG_ARRAY: u32 = 9;
+pub const TAG_METHOD: u32 = 10;
 
 /// Opcodes. Mirrors `crates/r8-abi`; the `CONFORMANCE_OPS` table below lists
 /// them in the same canonical order — keep both in sync.
@@ -91,11 +95,26 @@ pub const OP_SET_UPVALUE: u32 = 37;
 pub const OP_MAKE_CELL: u32 = 38;
 /// Calls the function value on the stack with the `operand` arguments above
 /// it: pops both, pushes a call frame, and enters the function body. Missing
-/// arguments read as `undefined`; extras are ignored.
+/// arguments read as `undefined`; extras are ignored. Calling a `TAG_METHOD`
+/// value dispatches to the bound builtin instead.
 pub const OP_CALL: u32 = 39;
+/// Pops `operand` values and builds an array object in the machine's arena.
+pub const OP_NEW_ARRAY: u32 = 40;
+/// Pops `2 × operand` values (key, value pairs, key pushed first) and builds
+/// an object in the machine's arena. Keys are string values.
+pub const OP_NEW_OBJECT: u32 = 41;
+/// Pops a key and a receiver; pushes the property per JS GetV semantics
+/// (array elements and `.length`, builtin methods, object keys, string
+/// indexing). Missing properties read as `undefined`.
+pub const OP_GET_INDEX: u32 = 42;
+/// Pops the key (top) and the value; the receiver stays (assignment
+/// expressions need the receiver evaluated exactly once, and keeping it
+/// lets plain and compound shapes align). Pushes the assigned value as the
+/// expression's result.
+pub const OP_SET_INDEX: u32 = 43;
 
 /// Canonical tag order mirrored from `crates/r8-abi`'s `CONFORMANCE_TAGS`.
-const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED, TAG_STRING, TAG_FUNCTION };
+const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED, TAG_STRING, TAG_FUNCTION, TAG_ARRAY, TAG_METHOD };
 
 /// Canonical opcode order mirrored from `crates/r8-abi`'s `CONFORMANCE_OPS`.
 /// New opcodes are appended at the end so existing indices stay stable.
@@ -140,6 +159,10 @@ const CONFORMANCE_OPS = [_]u32{
     OP_SET_UPVALUE,
     OP_MAKE_CELL,
     OP_CALL,
+    OP_NEW_ARRAY,
+    OP_NEW_OBJECT,
+    OP_GET_INDEX,
+    OP_SET_INDEX,
 };
 
 pub const Value = extern struct {
@@ -184,6 +207,21 @@ pub const Value = extern struct {
         if (self.tag != TAG_STRING) return null;
         const keel_string: *const KeelString = @ptrFromInt(@as(usize, @bitCast(self.payload)));
         return keel_string.ptr[0..keel_string.len];
+    }
+
+    pub fn asArray(self: Value) ?*KeelArray {
+        if (self.tag != TAG_ARRAY) return null;
+        return @ptrFromInt(@as(usize, @bitCast(self.payload)));
+    }
+
+    pub fn asObject(self: Value) ?*KeelObject {
+        if (self.tag != TAG_OBJECT) return null;
+        return @ptrFromInt(@as(usize, @bitCast(self.payload)));
+    }
+
+    pub fn asMethod(self: Value) ?*KeelMethod {
+        if (self.tag != TAG_METHOD) return null;
+        return @ptrFromInt(@as(usize, @bitCast(self.payload)));
     }
 
     pub fn isNumber(self: Value) bool {
@@ -244,12 +282,31 @@ pub const KeelFunction = extern struct {
     arity: u32,
 };
 
+/// An array's element storage; mirrors `crates/r8-abi`'s `KeelArray`.
+pub const KeelArray = extern struct {
+    items: [*]Value,
+    len: usize,
+};
+
+/// An object's parallel key/value storage; mirrors `KeelObject`.
+pub const KeelObject = extern struct {
+    keys: [*]Value,
+    values: [*]Value,
+    len: usize,
+};
+
+/// A bound builtin method; mirrors `KeelMethod`.
+pub const KeelMethod = extern struct {
+    receiver: Value,
+    id: u32,
+};
+
 comptime {
     if (@sizeOf(Value) != 16) @compileError("Value must be 16 bytes");
     if (@alignOf(Value) != 8) @compileError("Value must align to 8");
     if (@sizeOf(Instruction) != 8) @compileError("Instruction must be 8 bytes");
-    if (CONFORMANCE_TAGS.len != 8) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
-    if (CONFORMANCE_OPS.len != 40) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
+    if (CONFORMANCE_TAGS.len != 10) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
+    if (CONFORMANCE_OPS.len != 44) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
 }
 
 pub export fn r8_abi_version() u32 {

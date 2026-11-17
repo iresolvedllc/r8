@@ -20,8 +20,13 @@
 //! `len`, `local_count`, `arity` per function, bodies inline in the flat
 //! instruction stream), closure creation and capture opcodes, upvalue
 //! access, and call frames inside the machine.
+//!
+//! ABI v6 adds arrays and objects: `TAG_ARRAY` / `TAG_OBJECT` (arena-owned
+//! element/property storage), `TAG_METHOD` (a bound builtin: receiver +
+//! method id), array/object construction, and unified property access
+//! (`a.b` compiles to `a["b"]`) with JS GetV semantics.
 
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 /// Value tags. `CONFORMANCE_TAGS` lists these in a canonical order; keep both
 /// in sync with `zig/src/abi.zig`.
@@ -33,6 +38,8 @@ pub const TAG_NULL: u32 = 5;
 pub const TAG_UNDEFINED: u32 = 6;
 pub const TAG_STRING: u32 = 7;
 pub const TAG_FUNCTION: u32 = 8;
+pub const TAG_ARRAY: u32 = 9;
+pub const TAG_METHOD: u32 = 10;
 
 /// Opcodes. `CONFORMANCE_OPS` lists these in a canonical order; keep both in
 /// sync with `zig/src/abi.zig`.
@@ -107,8 +114,23 @@ pub const OP_SET_UPVALUE: u32 = 37;
 pub const OP_MAKE_CELL: u32 = 38;
 /// Calls the function value on the stack with the `operand` arguments above
 /// it: pops both, pushes a call frame, and enters the function body. Missing
-/// arguments read as `undefined`; extras are ignored.
+/// arguments read as `undefined`; extras are ignored. Calling a `TAG_METHOD`
+/// value dispatches to the bound builtin instead.
 pub const OP_CALL: u32 = 39;
+/// Pops `operand` values and builds an array object in the machine's arena.
+pub const OP_NEW_ARRAY: u32 = 40;
+/// Pops `2 × operand` values (key, value pairs, key pushed first) and builds
+/// an object in the machine's arena. Keys are string values.
+pub const OP_NEW_OBJECT: u32 = 41;
+/// Pops a key and a receiver; pushes the property per JS GetV semantics
+/// (array elements and `.length`, builtin methods, object keys, string
+/// indexing). Missing properties read as `undefined`.
+pub const OP_GET_INDEX: u32 = 42;
+/// Pops the key (top) and the value; the receiver stays (assignment
+/// expressions need the receiver evaluated exactly once, and keeping it
+/// lets plain and compound shapes align). Pushes the assigned value as the
+/// expression's result.
+pub const OP_SET_INDEX: u32 = 43;
 
 /// Canonical tag order mirrored by `zig/src/abi.zig` for conformance probes.
 /// New tags are appended at the end so existing indices stay stable.
@@ -121,6 +143,8 @@ pub const CONFORMANCE_TAGS: &[u32] = &[
     TAG_UNDEFINED,
     TAG_STRING,
     TAG_FUNCTION,
+    TAG_ARRAY,
+    TAG_METHOD,
 ];
 
 /// Canonical opcode order mirrored by `zig/src/abi.zig` for conformance probes.
@@ -166,6 +190,10 @@ pub const CONFORMANCE_OPS: &[u32] = &[
     OP_SET_UPVALUE,
     OP_MAKE_CELL,
     OP_CALL,
+    OP_NEW_ARRAY,
+    OP_NEW_OBJECT,
+    OP_GET_INDEX,
+    OP_SET_INDEX,
 ];
 
 #[repr(C)]
@@ -240,6 +268,22 @@ impl Value {
         let bytes = unsafe { std::slice::from_raw_parts(keel_string.ptr, keel_string.len) };
         std::str::from_utf8(bytes).ok()
     }
+
+    /// Resolves an array value's element storage. The slice points into the
+    /// machine's arena and is valid until the next `r8_machine_run`.
+    pub fn as_array(&self) -> Option<&'static KeelArray> {
+        (self.tag == TAG_ARRAY).then(|| unsafe { &*(self.payload as *const KeelArray) })
+    }
+
+    /// Resolves an object value's property storage, as with `as_array`.
+    pub fn as_object(&self) -> Option<&'static KeelObject> {
+        (self.tag == TAG_OBJECT).then(|| unsafe { &*(self.payload as *const KeelObject) })
+    }
+
+    /// Resolves a method value's binding, as with `as_array`.
+    pub fn as_method(&self) -> Option<&'static KeelMethod> {
+        (self.tag == TAG_METHOD).then(|| unsafe { &*(self.payload as *const KeelMethod) })
+    }
 }
 
 /// A borrowed string in memory owned by whoever created the value (the Rust
@@ -260,6 +304,30 @@ pub struct KeelFunction {
     pub len: u32,
     pub local_count: u32,
     pub arity: u32,
+}
+
+/// An array's element storage in the machine's arena.
+#[repr(C)]
+pub struct KeelArray {
+    pub items: *mut Value,
+    pub len: usize,
+}
+
+/// An object's property storage: parallel key/value arrays of values (keys
+/// are `TAG_STRING` values), scanned linearly.
+#[repr(C)]
+pub struct KeelObject {
+    pub keys: *mut Value,
+    pub values: *mut Value,
+    pub len: usize,
+}
+
+/// A bound builtin method: which builtin, and the receiver it was read
+/// from. Built-in method ids are defined by the machine.
+#[repr(C)]
+pub struct KeelMethod {
+    pub receiver: Value,
+    pub id: u32,
 }
 
 impl Value {
@@ -297,8 +365,26 @@ impl std::fmt::Display for Value {
                 None => f.write_str("<string>"),
             },
             TAG_FUNCTION => f.write_str("[function]"),
-            // Placeholder until objects exist (Phase 5).
-            TAG_OBJECT => f.write_str("[object]"),
+            TAG_ARRAY => {
+                f.write_str("")?;
+                // JS `String(array)` joins elements with "," (null and
+                // undefined render as empty).
+                if let Some(array) = self.as_array() {
+                    let items = unsafe { std::slice::from_raw_parts(array.items, array.len) };
+                    for (index, item) in items.iter().enumerate() {
+                        if index > 0 {
+                            f.write_str(",")?;
+                        }
+                        match item.tag {
+                            TAG_NULL | TAG_UNDEFINED => {}
+                            _ => write!(f, "{item}")?,
+                        }
+                    }
+                }
+                Ok(())
+            }
+            TAG_OBJECT => f.write_str("[object Object]"),
+            TAG_METHOD => f.write_str("[method]"),
             _ => write!(f, "<value tag={}>", self.tag),
         }
     }
@@ -482,6 +568,34 @@ impl Instruction {
         }
     }
 
+    pub const fn new_array(element_count: usize) -> Self {
+        Self {
+            op: OP_NEW_ARRAY,
+            operand: element_count as i32,
+        }
+    }
+
+    pub const fn new_object(property_count: usize) -> Self {
+        Self {
+            op: OP_NEW_OBJECT,
+            operand: property_count as i32,
+        }
+    }
+
+    pub const fn get_index() -> Self {
+        Self {
+            op: OP_GET_INDEX,
+            operand: 0,
+        }
+    }
+
+    pub const fn set_index() -> Self {
+        Self {
+            op: OP_SET_INDEX,
+            operand: 0,
+        }
+    }
+
     pub const fn print() -> Self {
         Self {
             op: OP_PRINT,
@@ -661,5 +775,86 @@ mod tests {
         assert_eq!(Value::boolean(false).to_string(), "false");
         assert_eq!(Value::NULL.to_string(), "null");
         assert_eq!(Value::UNDEFINED.to_string(), "undefined");
+    }
+
+    #[test]
+    fn conformance_tables_cover_every_constant() {
+        // Every TAG_* and OP_* constant must appear in its conformance table
+        // (the anti-drift gate is only as good as its coverage).
+        let tags = [
+            TAG_INT,
+            TAG_OBJECT,
+            TAG_FLOAT,
+            TAG_BOOL,
+            TAG_NULL,
+            TAG_UNDEFINED,
+            TAG_STRING,
+            TAG_FUNCTION,
+            TAG_ARRAY,
+            TAG_METHOD,
+        ];
+        for tag in tags {
+            assert!(
+                CONFORMANCE_TAGS.contains(&tag),
+                "tag {tag} missing from CONFORMANCE_TAGS"
+            );
+        }
+        for op in CONFORMANCE_OPS {
+            let _ = op;
+        }
+        let ops = [
+            OP_LOAD_INT,
+            OP_ADD,
+            OP_RETURN,
+            OP_LOAD_F64_HI,
+            OP_LOAD_F64,
+            OP_SUB,
+            OP_MUL,
+            OP_DIV,
+            OP_MOD,
+            OP_POW,
+            OP_LT,
+            OP_GT,
+            OP_LE,
+            OP_GE,
+            OP_EQ,
+            OP_NE,
+            OP_EQ_STRICT,
+            OP_NE_STRICT,
+            OP_NEG,
+            OP_NOT,
+            OP_LOAD_BOOL,
+            OP_LOAD_NULL,
+            OP_LOAD_UNDEFINED,
+            OP_PRINT,
+            OP_POP,
+            OP_DUP,
+            OP_GET_LOCAL,
+            OP_SET_LOCAL,
+            OP_JMP,
+            OP_JMP_IF_FALSE,
+            OP_JMP_IF_TRUE,
+            OP_LOAD_STRING,
+            OP_TO_STRING,
+            OP_CLOSURE,
+            OP_CAPTURE_LOCAL,
+            OP_CAPTURE_UPVALUE,
+            OP_GET_UPVALUE,
+            OP_SET_UPVALUE,
+            OP_MAKE_CELL,
+            OP_CALL,
+            OP_NEW_ARRAY,
+            OP_NEW_OBJECT,
+            OP_GET_INDEX,
+            OP_SET_INDEX,
+        ];
+        for op in ops {
+            assert!(
+                CONFORMANCE_OPS.contains(&op),
+                "opcode {op} missing from CONFORMANCE_OPS"
+            );
+        }
+        assert_eq!(CONFORMANCE_TAGS.len(), tags.len());
+        assert_eq!(CONFORMANCE_OPS.len(), ops.len());
     }
 }

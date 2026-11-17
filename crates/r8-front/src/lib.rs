@@ -97,6 +97,24 @@ pub enum TemplatePart {
     Substitution(Expr),
 }
 
+/// An object literal property's key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectKey {
+    /// `{ name: ... }` and shorthand `{ name }`.
+    Ident(String),
+    /// `{ "name": ... }`.
+    Literal(String),
+    /// `{ [expr]: ... }` — the expression is stringified.
+    Computed(Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectProperty {
+    pub key: ObjectKey,
+    /// `None` for shorthand properties (value = a reference to the key).
+    pub value: Option<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i64),
@@ -120,12 +138,22 @@ pub enum Expr {
     },
     /// `callee(arg, ...)` — the callee is any expression.
     Call(Box<Expr>, Vec<Expr>),
-    Assign(AssignOp, String, Box<Expr>),
+    /// `target = value` / `target op= value`, where the target is a variable,
+    /// a property, or a computed index (guaranteed by the parser).
+    Assign(AssignOp, Box<Expr>, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
     /// The `console.log` intrinsic, recognized syntactically until a general
     /// call mechanism exists (Phase 4).
     ConsoleLog(Box<Expr>),
+    /// `[a, b, ...]` — holes (`[1,,2]`) carry `None`.
+    Array(Vec<Option<Expr>>),
+    /// `{ key: value, ... }`.
+    Object(Vec<ObjectProperty>),
+    /// `receiver.name` (compiles to an index read with a string key).
+    Property(Box<Expr>, String),
+    /// `receiver[key]`.
+    Index(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,7 +231,10 @@ pub enum Token {
     RParen,
     LeftBrace,
     RightBrace,
+    LeftBracket,
+    RightBracket,
     Dot,
+    Colon,
     Comma,
     Semicolon,
     EqArrow,
@@ -639,6 +670,18 @@ impl Lexer<'_> {
                 self.tokens.push(Token::RightBrace);
                 self.index += 1;
             }
+            '[' => {
+                self.tokens.push(Token::LeftBracket);
+                self.index += 1;
+            }
+            ']' => {
+                self.tokens.push(Token::RightBracket);
+                self.index += 1;
+            }
+            ':' => {
+                self.tokens.push(Token::Colon);
+                self.index += 1;
+            }
             '.' => {
                 if self
                     .characters
@@ -851,12 +894,12 @@ impl Parser {
             _ => return Ok(left),
         };
         self.index += 1;
-        let target = match left {
-            Expr::Var(name) => name,
+        match left {
+            Expr::Var(_) | Expr::Property(_, _) | Expr::Index(_, _) => {}
             _ => return Err(ParseError::Unsupported("only simple assignment targets")),
-        };
+        }
         let value = self.assignment()?;
-        Ok(Expr::Assign(op, target, Box::new(value)))
+        Ok(Expr::Assign(op, Box::new(left), Box::new(value)))
     }
 
     fn logical_or(&mut self) -> Result<Expr, ParseError> {
@@ -969,29 +1012,151 @@ impl Parser {
         Ok(Expr::Unary(op, Box::new(operand)))
     }
 
-    /// Postfix operators: call arguments `f(a, b)`. Property access arrives
-    /// in Phase 5.
+    /// Postfix operators: call arguments `f(a, b)`, property access `a.b`,
+    /// and computed access `a[key]`.
     fn postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expression = self.primary()?;
-        while self.peek() == &Token::LParen {
-            self.index += 1;
-            let mut arguments = Vec::new();
-            if self.peek() == &Token::RParen {
-                self.index += 1;
-            } else {
-                loop {
-                    arguments.push(self.assignment()?);
+        loop {
+            match self.peek() {
+                Token::LParen => {
+                    self.index += 1;
+                    let mut arguments = Vec::new();
+                    if self.peek() == &Token::RParen {
+                        self.index += 1;
+                    } else {
+                        loop {
+                            arguments.push(self.assignment()?);
+                            match self.next() {
+                                Token::Comma => {}
+                                Token::RParen => break,
+                                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                                _ => return Err(ParseError::TrailingInput),
+                            }
+                        }
+                    }
+                    expression = Expr::Call(Box::new(expression), arguments);
+                }
+                Token::Dot => {
+                    self.index += 1;
+                    let name = self.property_name()?;
+                    expression = Expr::Property(Box::new(expression), name);
+                }
+                Token::LeftBracket => {
+                    self.index += 1;
+                    let key = self.assignment()?;
                     match self.next() {
-                        Token::Comma => {}
-                        Token::RParen => break,
+                        Token::RightBracket => {}
                         Token::Eof => return Err(ParseError::UnexpectedEnd),
                         _ => return Err(ParseError::TrailingInput),
                     }
+                    expression = Expr::Index(Box::new(expression), Box::new(key));
                 }
+                _ => break,
             }
-            expression = Expr::Call(Box::new(expression), arguments);
         }
         Ok(expression)
+    }
+
+    /// A property name after `.`: an identifier or a reserved word (JS
+    /// allows `a.for`, `a.class`, ...).
+    fn property_name(&mut self) -> Result<String, ParseError> {
+        let name = match self.next() {
+            Token::Identifier(name) => name,
+            Token::Let => "let".into(),
+            Token::Var => "var".into(),
+            Token::Const => "const".into(),
+            Token::If => "if".into(),
+            Token::Else => "else".into(),
+            Token::While => "while".into(),
+            Token::For => "for".into(),
+            Token::Function => "function".into(),
+            Token::Return => "return".into(),
+            Token::True => "true".into(),
+            Token::False => "false".into(),
+            Token::Null => "null".into(),
+            Token::Undefined => "undefined".into(),
+            Token::Eof => return Err(ParseError::UnexpectedEnd),
+            _ => return Err(ParseError::TrailingInput),
+        };
+        Ok(name)
+    }
+
+    /// `[a, b, ...]` with holes (`[1,,2]`) and a trailing comma. The `[` was
+    /// already consumed by `primary`.
+    fn array_literal(&mut self) -> Result<Expr, ParseError> {
+        let mut elements = Vec::new();
+        loop {
+            if self.peek() == &Token::RightBracket {
+                self.index += 1;
+                break;
+            }
+            if self.peek() == &Token::Eof {
+                return Err(ParseError::UnexpectedEnd);
+            }
+            if self.peek() == &Token::Comma {
+                self.index += 1;
+                elements.push(None);
+                continue;
+            }
+            elements.push(Some(self.assignment()?));
+            match self.next() {
+                Token::Comma => {}
+                Token::RightBracket => break,
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                _ => return Err(ParseError::TrailingInput),
+            }
+        }
+        Ok(Expr::Array(elements))
+    }
+
+    /// `{ key: value, shorthand }` with string and computed keys and a
+    /// trailing comma. In statement position `{` is a block; this parses
+    /// only from expression position. The `{` was already consumed.
+    fn object_literal(&mut self) -> Result<Expr, ParseError> {
+        let mut properties = Vec::new();
+        loop {
+            while self.peek() == &Token::Comma {
+                self.index += 1;
+            }
+            if self.peek() == &Token::RightBrace {
+                self.index += 1;
+                break;
+            }
+            if self.peek() == &Token::Eof {
+                return Err(ParseError::UnexpectedEnd);
+            }
+            let key = match self.next() {
+                Token::Identifier(name) => ObjectKey::Ident(name),
+                Token::String(text) => ObjectKey::Literal(text),
+                Token::LeftBracket => {
+                    let expression = self.assignment()?;
+                    match self.next() {
+                        Token::RightBracket => {}
+                        Token::Eof => return Err(ParseError::UnexpectedEnd),
+                        _ => return Err(ParseError::TrailingInput),
+                    }
+                    ObjectKey::Computed(Box::new(expression))
+                }
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                _ => return Err(ParseError::Unsupported("object property keys")),
+            };
+            let value = if self.peek() == &Token::Colon {
+                self.index += 1;
+                Some(self.assignment()?)
+            } else if matches!(key, ObjectKey::Ident(_)) {
+                None // shorthand: value is a reference to the key
+            } else {
+                return Err(ParseError::TrailingInput);
+            };
+            properties.push(ObjectProperty { key, value });
+            match self.next() {
+                Token::Comma => {}
+                Token::RightBrace => break,
+                Token::Eof => return Err(ParseError::UnexpectedEnd),
+                _ => return Err(ParseError::TrailingInput),
+            }
+        }
+        Ok(Expr::Object(properties))
     }
 
     fn primary(&mut self) -> Result<Expr, ParseError> {
@@ -1006,7 +1171,6 @@ impl Parser {
             Token::Undefined => Ok(Expr::Undefined),
             Token::Identifier(name) if name == "console" => self.console_log(),
             Token::Identifier(name) => {
-                // Single-parameter arrow without parens: `x => body`.
                 if self.tokens.get(self.index) == Some(&Token::EqArrow) {
                     self.next(); // `=>`
                     let params = vec![name];
@@ -1015,6 +1179,8 @@ impl Parser {
                 }
                 Ok(Expr::Var(name))
             }
+            Token::LeftBracket => self.array_literal(),
+            Token::LeftBrace => self.object_literal(),
             Token::LParen => {
                 // Arrow disambiguation: `(a, b) => ...` vs a parenthesized
                 // expression. Lookahead scans for a simple identifier list
@@ -1402,12 +1568,6 @@ enum Capture {
     Local(usize),
     /// An upvalue of the immediately enclosing function (transitive).
     Upvalue(usize),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssignTarget {
-    Local(usize, bool),
-    Upvalue(usize, bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1799,13 +1959,24 @@ impl Compiler {
                     Self::walk_nested_function(params, &[], Some(expression), bound, captured, free)
                 }
             },
-            Expr::Assign(_, name, value) => {
-                Self::walk_expr(value, bound, captured, free);
-                // The target reads like a variable reference for capture
-                // purposes.
-                if !bound.contains(name) {
-                    free.insert(name.clone());
+            Expr::Assign(_, target, value) => {
+                // Walk the target's sub-expressions (receivers/keys can be
+                // arbitrary expressions that nested functions may capture)
+                // without treating the target itself as a free reference.
+                match target.as_ref() {
+                    Expr::Var(name) => {
+                        if !bound.contains(name) {
+                            free.insert(name.clone());
+                        }
+                    }
+                    Expr::Property(receiver, _) => Self::walk_expr(receiver, bound, captured, free),
+                    Expr::Index(receiver, key) => {
+                        Self::walk_expr(receiver, bound, captured, free);
+                        Self::walk_expr(key, bound, captured, free);
+                    }
+                    _ => {}
                 }
+                Self::walk_expr(value, bound, captured, free);
             }
             Expr::Binary(_, left, right) => {
                 Self::walk_expr(left, bound, captured, free);
@@ -1817,6 +1988,34 @@ impl Compiler {
                 for argument in arguments {
                     Self::walk_expr(argument, bound, captured, free);
                 }
+            }
+            Expr::Array(elements) => {
+                for element in elements.iter().flatten() {
+                    Self::walk_expr(element, bound, captured, free);
+                }
+            }
+            Expr::Object(properties) => {
+                for property in properties {
+                    if let ObjectKey::Computed(key) = &property.key {
+                        Self::walk_expr(key, bound, captured, free);
+                    }
+                    match &property.value {
+                        Some(value) => Self::walk_expr(value, bound, captured, free),
+                        // Shorthand references the key name.
+                        None => {
+                            if let ObjectKey::Ident(name) = &property.key
+                                && !bound.contains(name)
+                            {
+                                free.insert(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Property(receiver, _) => Self::walk_expr(receiver, bound, captured, free),
+            Expr::Index(receiver, key) => {
+                Self::walk_expr(receiver, bound, captured, free);
+                Self::walk_expr(key, bound, captured, free);
             }
             Expr::ConsoleLog(argument) => Self::walk_expr(argument, bound, captured, free),
         }
@@ -1894,6 +2093,64 @@ impl Compiler {
                 let index = self.string_index(text);
                 self.emit(Instruction::load_string(index));
             }
+            Expr::Array(elements) => {
+                for element in elements {
+                    match element {
+                        Some(expression) => self.expression(expression)?,
+                        None => {
+                            self.emit(Instruction::load_undefined());
+                        }
+                    }
+                }
+                self.emit(Instruction::new_array(elements.len()));
+            }
+            Expr::Object(properties) => {
+                for property in properties {
+                    // Keys push first: the machine pops key/value pairs.
+                    match &property.key {
+                        ObjectKey::Ident(name) | ObjectKey::Literal(name) => {
+                            let index = self.string_index(name);
+                            self.emit(Instruction::load_string(index));
+                        }
+                        ObjectKey::Computed(expression) => {
+                            self.expression(expression)?;
+                            self.emit(Instruction::unary(r8_abi::OP_TO_STRING));
+                        }
+                    }
+                    match &property.value {
+                        Some(value) => self.expression(value)?,
+                        None => {
+                            // Shorthand: the value is a reference to the key.
+                            let name = match &property.key {
+                                ObjectKey::Ident(name) => name,
+                                _ => unreachable!("shorthand requires an identifier key"),
+                            };
+                            match self.resolve(name) {
+                                Some(Resolved::Local { slot, .. }) => {
+                                    self.emit(Instruction::get_local(slot));
+                                }
+                                Some(Resolved::Upvalue { index, .. }) => {
+                                    self.emit(Instruction::get_upvalue(index));
+                                }
+                                None => return Err(CompileError::Undeclared(name.clone())),
+                            }
+                        }
+                    }
+                }
+                self.emit(Instruction::new_object(properties.len()));
+            }
+            Expr::Property(receiver, name) => {
+                // `receiver.name` is `receiver["name"]` (one GetV opcode).
+                self.expression(receiver)?;
+                let index = self.string_index(name);
+                self.emit(Instruction::load_string(index));
+                self.emit(Instruction::get_index());
+            }
+            Expr::Index(receiver, key) => {
+                self.expression(receiver)?;
+                self.expression(key)?;
+                self.emit(Instruction::get_index());
+            }
             Expr::Template(parts) => {
                 // Every substitution is explicitly stringified so `${a}${b}`
                 // never performs a numeric add, and a trailing text part
@@ -1949,51 +2206,115 @@ impl Compiler {
                 }
                 self.emit(Instruction::call(arguments.len()));
             }
-            Expr::Assign(op, name, value) => {
-                let target = match self.resolve(name) {
-                    Some(Resolved::Local { slot, is_const }) => AssignTarget::Local(slot, is_const),
-                    Some(Resolved::Upvalue { index, is_const }) => {
-                        AssignTarget::Upvalue(index, is_const)
+            Expr::Assign(op, target, value) => match target.as_ref() {
+                Expr::Var(name) => {
+                    let resolved = match self.resolve(name) {
+                        Some(resolved) => resolved,
+                        None => return Err(CompileError::Undeclared(name.clone())),
+                    };
+                    let (slot, index, is_const) = match resolved {
+                        Resolved::Local { slot, is_const } => (Some(slot), None, is_const),
+                        Resolved::Upvalue { index, is_const } => (None, Some(index), is_const),
+                    };
+                    if is_const {
+                        return Err(CompileError::ConstAssignment(name.clone()));
                     }
-                    None => return Err(CompileError::Undeclared(name.clone())),
-                };
-                let (slot, index, is_const) = match target {
-                    AssignTarget::Local(slot, is_const) => (Some(slot), None, is_const),
-                    AssignTarget::Upvalue(index, is_const) => (None, Some(index), is_const),
-                };
-                if is_const {
-                    return Err(CompileError::ConstAssignment(name.clone()));
-                }
-                if *op != AssignOp::Assign {
-                    // Compound assignment reads the target first.
+                    if *op != AssignOp::Assign {
+                        // Compound assignment reads the target first.
+                        if let Some(slot) = slot {
+                            self.emit(Instruction::get_local(slot));
+                        }
+                        if let Some(index) = index {
+                            self.emit(Instruction::get_upvalue(index));
+                        }
+                    }
+                    self.expression(value)?;
+                    let opcode = match op {
+                        AssignOp::Assign => None,
+                        AssignOp::AddAssign => BinaryOp::Add.opcode(),
+                        AssignOp::SubAssign => BinaryOp::Sub.opcode(),
+                        AssignOp::MulAssign => BinaryOp::Mul.opcode(),
+                        AssignOp::DivAssign => BinaryOp::Div.opcode(),
+                        AssignOp::ModAssign => BinaryOp::Mod.opcode(),
+                    };
+                    if let Some(opcode) = opcode {
+                        self.emit(Instruction::binary(opcode));
+                    }
+                    // The assignment expression's value is the assigned value.
+                    self.emit(Instruction::dup());
                     if let Some(slot) = slot {
-                        self.emit(Instruction::get_local(slot));
+                        self.emit(Instruction::set_local(slot));
                     }
                     if let Some(index) = index {
-                        self.emit(Instruction::get_upvalue(index));
+                        self.emit(Instruction::set_upvalue(index));
                     }
                 }
-                self.expression(value)?;
-                let opcode = match op {
-                    AssignOp::Assign => None,
-                    AssignOp::AddAssign => BinaryOp::Add.opcode(),
-                    AssignOp::SubAssign => BinaryOp::Sub.opcode(),
-                    AssignOp::MulAssign => BinaryOp::Mul.opcode(),
-                    AssignOp::DivAssign => BinaryOp::Div.opcode(),
-                    AssignOp::ModAssign => BinaryOp::Mod.opcode(),
-                };
-                if let Some(opcode) = opcode {
-                    self.emit(Instruction::binary(opcode));
+                Expr::Property(receiver, name) => {
+                    // Evaluate the receiver once, then:
+                    //   plain:    recv; value; key; set; pop -> value
+                    //   compound: recv; dup; key; get; value; op; key;
+                    //             set; pop -> new value
+                    // (`set_index` pops the key off the top, then the value,
+                    // and keeps the receiver, pushing the value back — so
+                    // both shapes end `[recv, value]` before the pop.)
+                    self.expression(receiver)?;
+                    let key_index = self.string_index(name);
+                    if *op != AssignOp::Assign {
+                        self.emit(Instruction::dup());
+                        self.emit(Instruction::load_string(key_index));
+                        self.emit(Instruction::get_index());
+                        self.expression(value)?;
+                        let opcode = match op {
+                            AssignOp::AddAssign => BinaryOp::Add,
+                            AssignOp::SubAssign => BinaryOp::Sub,
+                            AssignOp::MulAssign => BinaryOp::Mul,
+                            AssignOp::DivAssign => BinaryOp::Div,
+                            AssignOp::ModAssign => BinaryOp::Mod,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        self.emit(Instruction::binary(
+                            opcode.opcode().expect("non-logical op"),
+                        ));
+                        self.emit(Instruction::load_string(key_index));
+                    } else {
+                        self.expression(value)?;
+                        self.emit(Instruction::load_string(key_index));
+                    }
+                    self.emit(Instruction::set_index());
+                    self.emit(Instruction::pop());
                 }
-                // The assignment expression's value is the assigned value.
-                self.emit(Instruction::dup());
-                if let Some(slot) = slot {
-                    self.emit(Instruction::set_local(slot));
+                Expr::Index(receiver, key) => {
+                    // Same shape as property assignment, with a computed key
+                    // (evaluated once per read/write — twice for compound).
+                    self.expression(receiver)?;
+                    if *op != AssignOp::Assign {
+                        self.emit(Instruction::dup());
+                        self.expression(key)?;
+                        self.emit(Instruction::get_index());
+                        self.expression(value)?;
+                        let opcode = match op {
+                            AssignOp::AddAssign => BinaryOp::Add,
+                            AssignOp::SubAssign => BinaryOp::Sub,
+                            AssignOp::MulAssign => BinaryOp::Mul,
+                            AssignOp::DivAssign => BinaryOp::Div,
+                            AssignOp::ModAssign => BinaryOp::Mod,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        self.emit(Instruction::binary(
+                            opcode.opcode().expect("non-logical op"),
+                        ));
+                        self.expression(key)?;
+                    } else {
+                        self.expression(value)?;
+                        self.expression(key)?;
+                    }
+                    self.emit(Instruction::set_index());
+                    self.emit(Instruction::pop());
                 }
-                if let Some(index) = index {
-                    self.emit(Instruction::set_upvalue(index));
-                }
-            }
+                // The parser only accepts variables, properties, and
+                // computed keys as assignment targets.
+                _ => return Err(CompileError::Undeclared(String::new())),
+            },
             Expr::Binary(op, left, right) => match op {
                 BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
                     // Short-circuit: the deciding value is the result.
@@ -2611,31 +2932,39 @@ mod tests {
         assert_eq!(parse("x").unwrap(), Expr::Var("x".into()));
         assert_eq!(
             parse("x = 5").unwrap(),
-            Expr::Assign(AssignOp::Assign, "x".into(), Box::new(Expr::Int(5)))
+            Expr::Assign(
+                AssignOp::Assign,
+                Box::new(Expr::Var("x".into())),
+                Box::new(Expr::Int(5))
+            )
         );
         // Assignment is right-associative and lowest precedence.
         assert_eq!(
             parse("x = y = 5").unwrap(),
             Expr::Assign(
                 AssignOp::Assign,
-                "x".into(),
+                Box::new(Expr::Var("x".into())),
                 Box::new(Expr::Assign(
                     AssignOp::Assign,
-                    "y".into(),
+                    Box::new(Expr::Var("y".into())),
                     Box::new(Expr::Int(5))
                 ))
             )
         );
         assert_eq!(
             parse("x += 1").unwrap(),
-            Expr::Assign(AssignOp::AddAssign, "x".into(), Box::new(Expr::Int(1)))
+            Expr::Assign(
+                AssignOp::AddAssign,
+                Box::new(Expr::Var("x".into())),
+                Box::new(Expr::Int(1))
+            )
         );
         // Addition binds tighter than assignment.
         assert_eq!(
             parse("x = 1 + 2").unwrap(),
             Expr::Assign(
                 AssignOp::Assign,
-                "x".into(),
+                Box::new(Expr::Var("x".into())),
                 Box::new(Expr::Binary(
                     BinaryOp::Add,
                     Box::new(Expr::Int(1)),
@@ -3398,6 +3727,211 @@ mod tests {
                 Instruction::make_cell(0),
                 Instruction::closure(1),
                 Instruction::capture_local(0),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase5_tests {
+    use super::*;
+
+    #[test]
+    fn lexes_brackets_and_colons() {
+        assert_eq!(
+            tokenize("[ ] { } :").unwrap(),
+            vec![
+                Token::LeftBracket,
+                Token::RightBracket,
+                Token::LeftBrace,
+                Token::RightBrace,
+                Token::Colon,
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_array_literals() {
+        assert_eq!(
+            parse("[1, 2, 3]").unwrap(),
+            Expr::Array(vec![
+                Some(Expr::Int(1)),
+                Some(Expr::Int(2)),
+                Some(Expr::Int(3))
+            ])
+        );
+        // Holes and a trailing comma.
+        assert_eq!(
+            parse("[1,,3,]").unwrap(),
+            Expr::Array(vec![Some(Expr::Int(1)), None, Some(Expr::Int(3))])
+        );
+        assert!(parse("[]").is_ok());
+    }
+
+    #[test]
+    fn parses_object_literals() {
+        assert_eq!(
+            parse("({ a: 1 })").unwrap(),
+            Expr::Object(vec![ObjectProperty {
+                key: ObjectKey::Ident("a".into()),
+                value: Some(Expr::Int(1)),
+            }])
+        );
+        // Shorthand, string keys, computed keys.
+        assert_eq!(
+            parse("({ b, 'c d': 2, [k]: 3 })").unwrap(),
+            Expr::Object(vec![
+                ObjectProperty {
+                    key: ObjectKey::Ident("b".into()),
+                    value: None
+                },
+                ObjectProperty {
+                    key: ObjectKey::Literal("c d".into()),
+                    value: Some(Expr::Int(2))
+                },
+                ObjectProperty {
+                    key: ObjectKey::Computed(Box::new(Expr::Var("k".into()))),
+                    value: Some(Expr::Int(3))
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_property_and_index_access() {
+        assert_eq!(
+            parse("a.b.c").unwrap(),
+            Expr::Property(
+                Box::new(Expr::Property(Box::new(Expr::Var("a".into())), "b".into())),
+                "c".into()
+            )
+        );
+        assert_eq!(
+            parse("a[0]").unwrap(),
+            Expr::Index(Box::new(Expr::Var("a".into())), Box::new(Expr::Int(0)))
+        );
+        // Reserved words are legal property names.
+        assert_eq!(
+            parse("a.for").unwrap(),
+            Expr::Property(Box::new(Expr::Var("a".into())), "for".into())
+        );
+    }
+
+    #[test]
+    fn parses_method_calls_and_property_assignment() {
+        // .map chains naturally through property + call postfix.
+        assert!(matches!(
+            parse("values.map((value) => value * 2)").unwrap(),
+            Expr::Call(_, _)
+        ));
+        let assigned = parse("a.b = 5").unwrap();
+        assert!(matches!(
+            assigned,
+            Expr::Assign(_, ref target, _) if matches!(target.as_ref(), Expr::Property(_, _))
+        ));
+        let compound = parse("a[0] += 1").unwrap();
+        assert!(matches!(
+            compound,
+            Expr::Assign(_, ref target, _) if matches!(target.as_ref(), Expr::Index(_, _))
+        ));
+        // Non-targets still reject.
+        assert_eq!(
+            parse("1 = 2").unwrap_err(),
+            ParseError::Unsupported("only simple assignment targets")
+        );
+    }
+
+    #[test]
+    fn compiles_array_literal_with_elements() {
+        let compiled = compile(&parse("[1, 2]").unwrap()).unwrap();
+        assert_eq!(
+            compiled.instructions,
+            vec![
+                Instruction::load_int(1),
+                Instruction::load_int(2),
+                Instruction::new_array(2),
+                Instruction::return_()
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_object_literal_key_value_pairs() {
+        let compiled = compile(&parse("({ a: 1 })").unwrap()).unwrap();
+        assert_eq!(
+            compiled.instructions,
+            vec![
+                Instruction::load_string(0),
+                Instruction::load_int(1),
+                Instruction::new_object(1),
+                Instruction::return_()
+            ]
+        );
+        assert_eq!(compiled.pool[0].as_str(), Some("a"));
+    }
+
+    #[test]
+    fn compiles_property_access_as_string_index() {
+        let program = parse_program("let a = [1]; a.length").unwrap();
+        let compiled = compile_program(&program).unwrap();
+        let instructions = &compiled.instructions;
+        let main_start = compiled.functions[0].start as usize;
+        // `let a = [1]` is 3 instructions; then a.length -> get_local;
+        // load "length"; get_index
+        assert_eq!(
+            instructions[main_start + 3..main_start + 6],
+            vec![
+                Instruction::get_local(0),
+                Instruction::load_string(0), // pool: 0 = "length"
+                Instruction::get_index(),
+            ]
+        );
+        // The pool holds only "length" here ("1" is an int literal).
+        assert_eq!(compiled.pool.len(), 1);
+        assert_eq!(compiled.pool[0].as_str(), Some("length"));
+    }
+
+    #[test]
+    fn compiles_property_assignment_with_receiver_once() {
+        let program = parse_program("let o = {}; o.a = 5;").unwrap();
+        let compiled = compile_program(&program).unwrap();
+        let instructions = &compiled.instructions;
+        let main_start = compiled.functions[0].start as usize;
+        // `let o = {}` is 2 instructions; then o.a = 5:
+        // get o; load 5; load "a"; set_index; pop
+        assert_eq!(
+            instructions[main_start + 2..main_start + 7],
+            vec![
+                Instruction::get_local(0),
+                Instruction::load_int(5),
+                Instruction::load_string(0),
+                Instruction::set_index(),
+                Instruction::pop(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_compound_property_assignment() {
+        let program = parse_program("let o = {}; o.n += 2;").unwrap();
+        let compiled = compile_program(&program).unwrap();
+        let instructions = &compiled.instructions;
+        let main_start = compiled.functions[0].start as usize;
+        // `let o = {}` is 2 instructions; then o.n += 2:
+        // get o; dup; key; get; load 2; add; key; set; pop
+        assert_eq!(
+            instructions[main_start + 2..main_start + 11],
+            vec![
+                Instruction::get_local(0),
+                Instruction::dup(),
+                Instruction::load_string(0),
+                Instruction::get_index(),
+                Instruction::load_int(2),
+                Instruction::binary(r8_abi::OP_ADD),
+                Instruction::load_string(0),
+                Instruction::set_index(),
+                Instruction::pop(),
             ]
         );
     }

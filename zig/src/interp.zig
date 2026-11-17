@@ -1,12 +1,12 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 
-/// The machine's string arena. Runtime strings and copies of pool constants
-/// are allocated here and live until the next run resets it (a documented
-/// leak-per-run until the GC phase). A spinlock guards it: the machine holds
-/// global state, so runs are serialized (true isolation/isolates arrive with
-/// the Phase 6 runtime work).
-var string_arena: ?std.heap.ArenaAllocator = null;
+/// The machine's string/heap arena. Runtime strings, arrays, objects, cells,
+/// and function objects are allocated here and live until the next run
+/// resets it (a documented leak-per-run until the GC phase). A spinlock
+/// guards it: the machine holds global state, so runs are serialized (true
+/// isolation/isolates arrive with the Phase 6 runtime work).
+var machine_arena: ?std.heap.ArenaAllocator = null;
 var machine_lock = std.atomic.Value(u32).init(0);
 
 fn acquireMachine() void {
@@ -19,13 +19,13 @@ fn releaseMachine() void {
     machine_lock.store(0, .release);
 }
 
-fn resetStringArena() void {
-    if (string_arena) |*arena| arena.deinit();
-    string_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+fn resetArena() void {
+    if (machine_arena) |*arena| arena.deinit();
+    machine_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 }
 
 fn machineAllocator() std.mem.Allocator {
-    return string_arena.?.allocator();
+    return machine_arena.?.allocator();
 }
 
 /// Allocates a string value in the machine's arena.
@@ -44,24 +44,50 @@ fn allocStringFrom(ptr: [*]const u8, len: usize) abi.Value {
     return .{ .tag = abi.TAG_STRING, ._pad = 0, .payload = @bitCast(@intFromPtr(keel_string)) };
 }
 
-/// The bytecode machine: a stack interpreter over Keel instructions.
-///
-/// Numeric semantics follow JavaScript: `+ - * %` run on an integer fast
-/// path and promote to doubles on overflow, float operands, or division;
-/// comparisons are numeric; equality distinguishes loose from strict;
-/// every value prints exactly like JS `Number::toString` / `String()`.
-///
-/// Locals are a flat array; each call frame owns a region of it (base +
-/// per-function `local_count`), so recursion nests naturally. Block
-/// shadowing needs no runtime save/restore because every declaration gets
-/// its own frame-relative slot. Captured bindings are moved into heap cells
-/// (`OP_MAKE_CELL`); access routes through the cell transparently, and
-/// closures hold cell pointers, so mutation semantics are JS-correct and
-/// cells outlive their frame.
-///
-/// Function bodies live inline in the flat instruction stream, referenced
-/// through a `KeelFunction` table (`start`, `len`, `local_count`, `arity`);
-/// entry 0 is the main body where execution begins.
+/// Copies `items` into the arena and wraps them as an array value.
+fn allocArray(items: []const abi.Value) abi.Value {
+    const allocator = machineAllocator();
+    const data = allocator.alloc(abi.Value, items.len) catch @panic("out of memory");
+    @memcpy(data, items);
+    const keel_array = allocator.create(abi.KeelArray) catch @panic("out of memory");
+    keel_array.* = .{ .items = data.ptr, .len = data.len };
+    return .{ .tag = abi.TAG_ARRAY, ._pad = 0, .payload = @bitCast(@intFromPtr(keel_array)) };
+}
+
+/// Copies keys/values into the arena and wraps them as an object value.
+fn allocObject(keys: []const abi.Value, values: []const abi.Value) abi.Value {
+    const allocator = machineAllocator();
+    const key_data = allocator.alloc(abi.Value, keys.len) catch @panic("out of memory");
+    @memcpy(key_data, keys);
+    const value_data = allocator.alloc(abi.Value, values.len) catch @panic("out of memory");
+    @memcpy(value_data, values);
+    const keel_object = allocator.create(abi.KeelObject) catch @panic("out of memory");
+    keel_object.* = .{ .keys = key_data.ptr, .values = value_data.ptr, .len = keys.len };
+    return .{ .tag = abi.TAG_OBJECT, ._pad = 0, .payload = @bitCast(@intFromPtr(keel_object)) };
+}
+
+/// Wraps a receiver + builtin id into a method value.
+fn allocMethod(receiver: abi.Value, id: u32) abi.Value {
+    const allocator = machineAllocator();
+    const keel_method = allocator.create(abi.KeelMethod) catch @panic("out of memory");
+    keel_method.* = .{ .receiver = receiver, .id = id };
+    return .{ .tag = abi.TAG_METHOD, ._pad = 0, .payload = @bitCast(@intFromPtr(keel_method)) };
+}
+
+/// Built-in methods reachable as property values. The u32 ids are part of
+/// the machine-internal `KeelMethod` representation.
+const Builtin = enum(u32) {
+    map = 0,
+    join = 1,
+
+    fn fromId(id: u32) ?Builtin {
+        return switch (id) {
+            0 => .map,
+            1 => .join,
+            else => null,
+        };
+    }
+};
 
 const LOCAL_CAPACITY = 512;
 const MAX_FRAMES = 64;
@@ -85,19 +111,8 @@ const Frame = struct {
     function: ?*FunctionObject,
 };
 
-fn localSlot(locals_base: usize, operand: i32) usize {
-    const slot = locals_base + @as(usize, @intCast(operand));
-    if (slot >= LOCAL_CAPACITY) @panic("local slot out of range");
-    return slot;
-}
-
-fn jumpTarget(operand: i32) usize {
-    if (operand < 0) @panic("jump target out of range");
-    return @intCast(operand);
-}
-
 const Stack = struct {
-    values: [256]abi.Value = undefined,
+    values: [4096]abi.Value = undefined,
     sp: usize = 0,
 
     fn push(self: *Stack, value: abi.Value) void {
@@ -122,6 +137,398 @@ const Arithmetic = enum { add, sub, mul, div, mod, pow };
 const Compare = enum { lt, gt, le, ge };
 const Equality = enum { loose, strict };
 
+/// The bytecode machine: a stack interpreter over Keel instructions.
+///
+/// Numeric semantics follow JavaScript: `+ - * %` run on an integer fast
+/// path and promote to doubles on overflow, float operands, or division;
+/// `+` concatenates when either side is a string, array, or object;
+/// comparisons are numeric (or bytewise for strings); equality distinguishes
+/// loose from strict; objects compare by reference; every value prints
+/// exactly like JS `String()`.
+///
+/// Locals are a flat array; each call frame owns a region of it. Captured
+/// bindings are moved into heap cells and accessed transparently. Function
+/// bodies live inline in the flat instruction stream through a
+/// `KeelFunction` table (entry 0 = main). Builtins (`.map`, `.join`) re-enter
+/// the interpreter through `invoke`, so callbacks run on the same machine.
+pub const Machine = struct {
+    stack: Stack = .{},
+    locals: [LOCAL_CAPACITY]abi.Value = undefined,
+    cells: [LOCAL_CAPACITY]?*Cell = undefined,
+    frames: [MAX_FRAMES]Frame = undefined,
+    fp: usize = 0,
+    locals_top: usize = 0,
+    pc: usize = 0,
+    code: []const abi.Instruction,
+    pool: []const abi.Value,
+    functions: []const abi.KeelFunction,
+    building: ?*FunctionObject = null,
+
+    fn init(
+        code: []const abi.Instruction,
+        pool: []const abi.Value,
+        functions: []const abi.KeelFunction,
+    ) Machine {
+        var machine = Machine{ .code = code, .pool = pool, .functions = functions };
+        for (&machine.locals) |*slot| slot.* = abi.Value.UNDEF;
+        for (&machine.cells) |*cell| cell.* = null;
+        // Entry 0 is the main body where execution begins.
+        const main_entry: abi.KeelFunction = if (functions.len > 0)
+            functions[0]
+        else
+            .{ .start = 0, .len = 0, .local_count = 0, .arity = 0 };
+        machine.pc = main_entry.start;
+        machine.locals_top = main_entry.local_count;
+        machine.frames[0] = .{
+            .return_pc = code.len,
+            .stack_base = 0,
+            .locals_base = 0,
+            .function = null,
+        };
+        machine.fp = 1;
+        return machine;
+    }
+
+    fn localSlot(self: *Machine, operand: i32) usize {
+        const slot = self.frames[self.fp - 1].locals_base + @as(usize, @intCast(operand));
+        if (slot >= LOCAL_CAPACITY) @panic("local slot out of range");
+        return slot;
+    }
+
+    fn jumpTarget(operand: i32) usize {
+        if (operand < 0) @panic("jump target out of range");
+        return @intCast(operand);
+    }
+
+    /// Runs the program to completion and returns the main frame's value.
+    pub fn execute(self: *Machine) abi.Value {
+        while (self.pc < self.code.len) {
+            if (self.step()) |value| return value;
+        }
+        return self.stack.top();
+    }
+
+    /// Executes a single instruction; returns the program result when the
+    /// main frame returns, else null.
+    fn step(self: *Machine) ?abi.Value {
+        const instruction = self.code[self.pc];
+        self.pc += 1;
+        switch (instruction.op) {
+            abi.OP_LOAD_INT => self.stack.push(abi.Value.fromInt(instruction.operand)),
+            // The raw high half of a float literal, pushed as ordinary data.
+            abi.OP_LOAD_F64_HI => self.stack.push(abi.Value.fromInt(instruction.operand)),
+            abi.OP_LOAD_F64 => {
+                const high = self.stack.pop();
+                const high_bits: u64 = @as(u64, @bitCast(high.payload)) & 0xFFFF_FFFF;
+                const low_bits: u64 = @as(u32, @bitCast(instruction.operand));
+                self.stack.push(abi.Value.fromFloat(@bitCast((high_bits << 32) | low_bits)));
+            },
+            abi.OP_LOAD_BOOL => self.stack.push(abi.Value.fromBool(instruction.operand != 0)),
+            abi.OP_LOAD_NULL => self.stack.push(abi.Value.NULL),
+            abi.OP_LOAD_UNDEFINED => self.stack.push(abi.Value.UNDEF),
+            abi.OP_LOAD_STRING => {
+                const index: usize = @intCast(instruction.operand);
+                if (index >= self.pool.len) @panic("string pool out of range");
+                const constant = self.pool[index];
+                if (constant.tag != abi.TAG_STRING) @panic("pool entry is not a string");
+                // Copy the pool bytes into the arena; the pool only needs to
+                // outlive the call.
+                self.stack.push(allocString(constant.asString().?));
+            },
+            abi.OP_TO_STRING => {
+                const value = self.stack.pop();
+                if (value.tag == abi.TAG_STRING) {
+                    self.stack.push(value);
+                } else {
+                    self.stack.push(allocString(stringBytesOf(value)));
+                }
+            },
+
+            abi.OP_ADD => binaryArithmetic(.add, self),
+            abi.OP_SUB => binaryArithmetic(.sub, self),
+            abi.OP_MUL => binaryArithmetic(.mul, self),
+            abi.OP_DIV => binaryArithmetic(.div, self),
+            abi.OP_MOD => binaryArithmetic(.mod, self),
+            abi.OP_POW => binaryArithmetic(.pow, self),
+
+            abi.OP_LT => binaryCompare(.lt, self),
+            abi.OP_GT => binaryCompare(.gt, self),
+            abi.OP_LE => binaryCompare(.le, self),
+            abi.OP_GE => binaryCompare(.ge, self),
+
+            abi.OP_EQ => binaryEquality(.loose, self),
+            abi.OP_NE => {
+                const right = self.stack.pop();
+                const left = self.stack.pop();
+                self.stack.push(abi.Value.fromBool(!equals(.loose, left, right)));
+            },
+            abi.OP_EQ_STRICT => binaryEquality(.strict, self),
+            abi.OP_NE_STRICT => {
+                const right = self.stack.pop();
+                const left = self.stack.pop();
+                self.stack.push(abi.Value.fromBool(!equals(.strict, left, right)));
+            },
+
+            abi.OP_NEG => self.stack.push(negate(self.stack.pop())),
+            abi.OP_NOT => {
+                const value = self.stack.pop();
+                self.stack.push(abi.Value.fromBool(!isTruthy(value)));
+            },
+
+            abi.OP_PRINT => {
+                // console.log intrinsic: pop, print, leave `undefined` behind
+                // so every expression still leaves exactly one value.
+                const value = self.stack.pop();
+                printValue(value);
+                self.stack.push(abi.Value.UNDEF);
+            },
+            abi.OP_POP => _ = self.stack.pop(),
+
+            abi.OP_DUP => {
+                const value = self.stack.pop();
+                self.stack.push(value);
+                self.stack.push(value);
+            },
+            abi.OP_GET_LOCAL => {
+                const slot = self.localSlot(instruction.operand);
+                if (self.cells[slot]) |cell| {
+                    self.stack.push(cell.value);
+                } else {
+                    self.stack.push(self.locals[slot]);
+                }
+            },
+            abi.OP_SET_LOCAL => {
+                const slot = self.localSlot(instruction.operand);
+                const value = self.stack.pop();
+                if (self.cells[slot]) |cell| {
+                    cell.value = value;
+                } else {
+                    self.locals[slot] = value;
+                }
+            },
+            abi.OP_MAKE_CELL => {
+                const slot = self.localSlot(instruction.operand);
+                const cell = machineAllocator().create(Cell) catch @panic("out of memory");
+                cell.* = .{ .value = self.locals[slot] };
+                self.cells[slot] = cell;
+            },
+
+            abi.OP_GET_UPVALUE => {
+                const index: usize = @intCast(instruction.operand);
+                const fo = self.frames[self.fp - 1].function orelse
+                    @panic("upvalue access in the main frame");
+                if (index >= fo.env.items.len) @panic("upvalue index out of range");
+                self.stack.push(fo.env.items[index].?.value);
+            },
+            abi.OP_SET_UPVALUE => {
+                const index: usize = @intCast(instruction.operand);
+                const fo = self.frames[self.fp - 1].function orelse
+                    @panic("upvalue access in the main frame");
+                if (index >= fo.env.items.len) @panic("upvalue index out of range");
+                fo.env.items[index].?.value = self.stack.pop();
+            },
+
+            abi.OP_CLOSURE => {
+                const index: usize = @intCast(instruction.operand);
+                if (index >= self.functions.len) @panic("function index out of range");
+                const fo = machineAllocator().create(FunctionObject) catch @panic("out of memory");
+                fo.* = .{ .index = index };
+                self.building = fo;
+                self.stack.push(.{
+                    .tag = abi.TAG_FUNCTION,
+                    ._pad = 0,
+                    .payload = @bitCast(@as(i64, @intCast(@intFromPtr(fo)))),
+                });
+            },
+            abi.OP_CAPTURE_LOCAL => {
+                const slot = self.localSlot(instruction.operand);
+                const cell = self.cells[slot] orelse @panic("capturing a local without a cell");
+                self.building.?.env.append(machineAllocator(), cell) catch @panic("out of memory");
+            },
+            abi.OP_CAPTURE_UPVALUE => {
+                const index: usize = @intCast(instruction.operand);
+                const parent = self.frames[self.fp - 1].function orelse
+                    @panic("capture from the main frame");
+                if (index >= parent.env.items.len) @panic("upvalue index out of range");
+                self.building.?.env.append(machineAllocator(), parent.env.items[index].?) catch @panic("out of memory");
+            },
+
+            abi.OP_JMP => self.pc = jumpTarget(instruction.operand),
+            abi.OP_JMP_IF_FALSE => {
+                const condition = self.stack.pop();
+                if (!isTruthy(condition)) self.pc = jumpTarget(instruction.operand);
+            },
+            abi.OP_JMP_IF_TRUE => {
+                const condition = self.stack.pop();
+                if (isTruthy(condition)) self.pc = jumpTarget(instruction.operand);
+            },
+
+            abi.OP_NEW_ARRAY => {
+                const count: usize = @intCast(instruction.operand);
+                if (self.stack.sp < count) @panic("stack underflow in array literal");
+                const start = self.stack.sp - count;
+                const value = allocArray(self.stack.values[start..self.stack.sp]);
+                self.stack.sp = start;
+                self.stack.push(value);
+            },
+            abi.OP_NEW_OBJECT => {
+                const count: usize = @intCast(instruction.operand);
+                if (self.stack.sp < count * 2) @panic("stack underflow in object literal");
+                const start = self.stack.sp - count * 2;
+                var keys = machineAllocator().alloc(abi.Value, count) catch @panic("out of memory");
+                var values = machineAllocator().alloc(abi.Value, count) catch @panic("out of memory");
+                for (0..count) |i| {
+                    keys[i] = self.stack.values[start + 2 * i];
+                    values[i] = self.stack.values[start + 2 * i + 1];
+                }
+                const object = allocObject(keys, values);
+                self.stack.sp = start;
+                self.stack.push(object);
+            },
+            abi.OP_GET_INDEX => {
+                const key = self.stack.pop();
+                const receiver = self.stack.pop();
+                self.stack.push(getIndex(receiver, key));
+            },
+            abi.OP_SET_INDEX => {
+                // Pops the key (top) and the value; the receiver stays
+                // (assignment expressions need the receiver evaluated exactly
+                // once, and keeping it lets plain and compound shapes
+                // align). Pushes the assigned value as the expression's
+                // result.
+                const key = self.stack.pop();
+                const value = self.stack.pop();
+                const receiver = self.stack.top();
+                setIndex(receiver, key, value);
+                self.stack.push(value);
+            },
+
+            abi.OP_CALL => {
+                const arg_count: usize = @intCast(instruction.operand);
+                if (arg_count > MAX_ARGS) @panic("too many arguments");
+                if (self.stack.sp < arg_count + 1) @panic("stack underflow in call");
+                var args: [MAX_ARGS]abi.Value = undefined;
+                for (0..arg_count) |i| args[i] = self.stack.values[self.stack.sp - arg_count + i];
+                const fn_value = self.stack.values[self.stack.sp - arg_count - 1];
+                self.stack.sp -= arg_count + 1;
+                // Bound builtins dispatch without a frame.
+                if (fn_value.tag == abi.TAG_METHOD) {
+                    const method: *abi.KeelMethod =
+                        @ptrFromInt(@as(usize, @bitCast(fn_value.payload)));
+                    self.stack.push(callBuiltin(self, method, args[0..arg_count]));
+                    return null;
+                }
+                self.stack.push(fn_value);
+                for (0..arg_count) |i| self.stack.push(args[i]);
+                self.performCall(arg_count);
+            },
+
+            abi.OP_RETURN => {
+                const frame = self.frames[self.fp - 1];
+                const value = if (self.stack.sp > frame.stack_base)
+                    self.stack.pop()
+                else
+                    abi.Value.UNDEF;
+                self.fp -= 1;
+                self.stack.sp = frame.stack_base;
+                self.locals_top = frame.locals_base;
+                if (self.fp == 0) return value; // returned from the main frame
+                self.pc = frame.return_pc;
+                self.stack.push(value);
+            },
+            else => @panic("unknown opcode"),
+        }
+        return null;
+    }
+
+    /// Shared call mechanics: the stack holds `[fn, arg1..argN]` with
+    /// `arg_count` arguments; pops them, pushes a frame, and enters the body.
+    fn performCall(self: *Machine, arg_count: usize) void {
+        if (self.stack.sp < arg_count + 1) @panic("stack underflow in call");
+        const fn_value = self.stack.values[self.stack.sp - arg_count - 1];
+        if (fn_value.tag != abi.TAG_FUNCTION) @panic("call of a non-function value");
+        const fo: *FunctionObject = @ptrFromInt(@as(usize, @bitCast(fn_value.payload)));
+        if (fo.index >= self.functions.len) @panic("function index out of range");
+        const entry = self.functions[fo.index];
+        if (self.fp >= MAX_FRAMES) @panic("call stack overflow");
+        const base = self.locals_top;
+        self.locals_top += entry.local_count;
+        if (self.locals_top > LOCAL_CAPACITY) @panic("too many locals");
+        for (0..entry.local_count) |i| self.cells[base + i] = null;
+        for (0..entry.arity) |i| {
+            // Missing arguments read as `undefined` (JS semantics).
+            self.locals[base + i] = if (i < arg_count) self.stack.values[self.stack.sp - arg_count + i] else abi.Value.UNDEF;
+        }
+        self.stack.sp -= arg_count + 1;
+        self.frames[self.fp] = .{
+            .return_pc = self.pc,
+            .stack_base = self.stack.sp,
+            .locals_base = base,
+            .function = fo,
+        };
+        self.fp += 1;
+        self.pc = entry.start;
+    }
+
+    /// Calls a function value with explicit arguments and returns its
+    /// result. Used by builtins (`.map`) to run interpreted callbacks on
+    /// this machine.
+    fn invoke(self: *Machine, callee: abi.Value, args: []const abi.Value) abi.Value {
+        const target_fp = self.fp;
+        self.stack.push(callee);
+        for (args) |arg| self.stack.push(arg);
+        self.performCall(args.len);
+        while (self.fp > target_fp) {
+            if (self.step()) |value| return value;
+        }
+        return self.stack.pop();
+    }
+
+    fn callBuiltin(
+        self: *Machine,
+        method: *abi.KeelMethod,
+        args: []const abi.Value,
+    ) abi.Value {
+        const builtin = Builtin.fromId(method.id) orelse @panic("unknown builtin");
+        switch (builtin) {
+            .map => {
+                if (method.receiver.tag != abi.TAG_ARRAY) @panic("map on a non-array");
+                const array = method.receiver.asArray().?;
+                if (args.len < 1 or args[0].tag != abi.TAG_FUNCTION)
+                    @panic("map callback must be a function");
+                const callback = args[0];
+                const items = machineAllocator().alloc(abi.Value, array.len) catch @panic("out of memory");
+                for (0..array.len) |i| {
+                    const element = array.items[i];
+                    const index = abi.Value.fromInt(@intCast(i));
+                    items[i] = self.invoke(callback, &[_]abi.Value{ element, index, method.receiver });
+                }
+                return allocArray(items);
+            },
+            .join => {
+                if (method.receiver.tag != abi.TAG_ARRAY) @panic("join on a non-array");
+                const array = method.receiver.asArray().?;
+                // JS default separator is ","; non-string separators coerce.
+                const separator: []const u8 = if (args.len > 0 and args[0].tag == abi.TAG_STRING)
+                    args[0].asString().?
+                else if (args.len > 0)
+                    stringBytesOf(args[0])
+                else
+                    ",";
+                var joined = std.ArrayList(u8).empty;
+                for (0..array.len) |i| {
+                    if (i > 0) joined.appendSlice(machineAllocator(), separator) catch @panic("out of memory");
+                    const element = array.items[i];
+                    // JS join renders null/undefined as empty strings.
+                    if (element.tag == abi.TAG_NULL or element.tag == abi.TAG_UNDEFINED) continue;
+                    joined.appendSlice(machineAllocator(), stringBytesOf(element)) catch @panic("out of memory");
+                }
+                return allocStringFrom(joined.items.ptr, joined.items.len);
+            },
+        }
+    }
+};
+
 pub fn run(
     instructions: []const abi.Instruction,
     pool: []const abi.Value,
@@ -129,225 +536,9 @@ pub fn run(
 ) abi.Value {
     acquireMachine();
     defer releaseMachine();
-    resetStringArena();
-    var stack: Stack = .{};
-    var locals: [LOCAL_CAPACITY]abi.Value = undefined;
-    for (&locals) |*slot| slot.* = abi.Value.UNDEF;
-    var cells: [LOCAL_CAPACITY]?*Cell = undefined;
-    for (&cells) |*cell| cell.* = null;
-    var frames: [MAX_FRAMES]Frame = undefined;
-    var fp: usize = 0;
-    var locals_top: usize = 0;
-    var pc: usize = 0;
-    // The closure under construction between `OP_CLOSURE` and its captures.
-    var building: ?*FunctionObject = null;
-
-    // Entry 0 is the main body where execution begins.
-    const main_entry: abi.KeelFunction = if (functions.len > 0)
-        functions[0]
-    else
-        .{ .start = 0, .len = 0, .local_count = 0, .arity = 0 };
-    pc = main_entry.start;
-    locals_top = main_entry.local_count;
-    frames[0] = .{ .return_pc = instructions.len, .stack_base = 0, .locals_base = 0, .function = null };
-    fp = 1;
-
-    while (pc < instructions.len) {
-        const instruction = instructions[pc];
-        pc += 1;
-        switch (instruction.op) {
-            abi.OP_LOAD_INT => stack.push(abi.Value.fromInt(instruction.operand)),
-            // The raw high half of a float literal, pushed as ordinary data.
-            abi.OP_LOAD_F64_HI => stack.push(abi.Value.fromInt(instruction.operand)),
-            abi.OP_LOAD_F64 => {
-                const high = stack.pop();
-                const high_bits: u64 = @as(u64, @bitCast(high.payload)) & 0xFFFF_FFFF;
-                const low_bits: u64 = @as(u32, @bitCast(instruction.operand));
-                stack.push(abi.Value.fromFloat(@bitCast((high_bits << 32) | low_bits)));
-            },
-            abi.OP_LOAD_BOOL => stack.push(abi.Value.fromBool(instruction.operand != 0)),
-            abi.OP_LOAD_NULL => stack.push(abi.Value.NULL),
-            abi.OP_LOAD_UNDEFINED => stack.push(abi.Value.UNDEF),
-
-            abi.OP_ADD => binaryArithmetic(.add, &stack),
-            abi.OP_SUB => binaryArithmetic(.sub, &stack),
-            abi.OP_MUL => binaryArithmetic(.mul, &stack),
-            abi.OP_DIV => binaryArithmetic(.div, &stack),
-            abi.OP_MOD => binaryArithmetic(.mod, &stack),
-            abi.OP_POW => binaryArithmetic(.pow, &stack),
-
-            abi.OP_LT => binaryCompare(.lt, &stack),
-            abi.OP_GT => binaryCompare(.gt, &stack),
-            abi.OP_LE => binaryCompare(.le, &stack),
-            abi.OP_GE => binaryCompare(.ge, &stack),
-
-            abi.OP_EQ => binaryEquality(.loose, &stack),
-            abi.OP_NE => {
-                const right = stack.pop();
-                const left = stack.pop();
-                stack.push(abi.Value.fromBool(!equals(.loose, left, right)));
-            },
-            abi.OP_EQ_STRICT => binaryEquality(.strict, &stack),
-            abi.OP_NE_STRICT => {
-                const right = stack.pop();
-                const left = stack.pop();
-                stack.push(abi.Value.fromBool(!equals(.strict, left, right)));
-            },
-
-            abi.OP_NEG => stack.push(negate(stack.pop())),
-            abi.OP_NOT => {
-                const value = stack.pop();
-                stack.push(abi.Value.fromBool(!isTruthy(value)));
-            },
-
-            abi.OP_PRINT => {
-                // console.log intrinsic: pop, print, leave `undefined` behind
-                // so every expression still leaves exactly one value.
-                const value = stack.pop();
-                printValue(value);
-                stack.push(abi.Value.UNDEF);
-            },
-            abi.OP_POP => _ = stack.pop(),
-
-            abi.OP_DUP => {
-                const value = stack.pop();
-                stack.push(value);
-                stack.push(value);
-            },
-            abi.OP_GET_LOCAL => {
-                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
-                if (cells[slot]) |cell| {
-                    stack.push(cell.value);
-                } else {
-                    stack.push(locals[slot]);
-                }
-            },
-            abi.OP_SET_LOCAL => {
-                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
-                const value = stack.pop();
-                if (cells[slot]) |cell| {
-                    cell.value = value;
-                } else {
-                    locals[slot] = value;
-                }
-            },
-            abi.OP_MAKE_CELL => {
-                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
-                const cell = machineAllocator().create(Cell) catch @panic("out of memory");
-                cell.* = .{ .value = locals[slot] };
-                cells[slot] = cell;
-            },
-
-            abi.OP_CLOSURE => {
-                const index: usize = @intCast(instruction.operand);
-                if (index >= functions.len) @panic("function index out of range");
-                const fo = machineAllocator().create(FunctionObject) catch @panic("out of memory");
-                fo.* = .{ .index = index };
-                building = fo;
-                stack.push(.{
-                    .tag = abi.TAG_FUNCTION,
-                    ._pad = 0,
-                    .payload = @bitCast(@as(i64, @intCast(@intFromPtr(fo)))),
-                });
-            },
-            abi.OP_CAPTURE_LOCAL => {
-                const slot = localSlot(frames[fp - 1].locals_base, instruction.operand);
-                const cell = cells[slot] orelse @panic("capturing a local without a cell");
-                building.?.env.append(machineAllocator(), cell) catch @panic("out of memory");
-            },
-            abi.OP_CAPTURE_UPVALUE => {
-                const index: usize = @intCast(instruction.operand);
-                const parent = frames[fp - 1].function orelse @panic("capture from the main frame");
-                if (index >= parent.env.items.len) @panic("upvalue index out of range");
-                building.?.env.append(machineAllocator(), parent.env.items[index].?) catch @panic("out of memory");
-            },
-            abi.OP_GET_UPVALUE => {
-                const index: usize = @intCast(instruction.operand);
-                const fo = frames[fp - 1].function orelse @panic("upvalue access in the main frame");
-                if (index >= fo.env.items.len) @panic("upvalue index out of range");
-                stack.push(fo.env.items[index].?.value);
-            },
-            abi.OP_SET_UPVALUE => {
-                const index: usize = @intCast(instruction.operand);
-                const fo = frames[fp - 1].function orelse @panic("upvalue access in the main frame");
-                if (index >= fo.env.items.len) @panic("upvalue index out of range");
-                fo.env.items[index].?.value = stack.pop();
-            },
-
-            abi.OP_JMP => pc = jumpTarget(instruction.operand),
-            abi.OP_JMP_IF_FALSE => {
-                const condition = stack.pop();
-                if (!isTruthy(condition)) pc = jumpTarget(instruction.operand);
-            },
-            abi.OP_JMP_IF_TRUE => {
-                const condition = stack.pop();
-                if (isTruthy(condition)) pc = jumpTarget(instruction.operand);
-            },
-
-            abi.OP_LOAD_STRING => {
-                const index: usize = @intCast(instruction.operand);
-                if (index >= pool.len) @panic("string pool out of range");
-                const constant = pool[index];
-                if (constant.tag != abi.TAG_STRING) @panic("pool entry is not a string");
-                // Copy the pool bytes into the arena; the pool only needs to
-                // outlive the call.
-                stack.push(allocString(constant.asString().?));
-            },
-            abi.OP_TO_STRING => {
-                const value = stack.pop();
-                if (value.tag == abi.TAG_STRING) {
-                    stack.push(value);
-                } else {
-                    stack.push(allocString(stringBytesOf(value)));
-                }
-            },
-
-            abi.OP_CALL => {
-                const arg_count: usize = @intCast(instruction.operand);
-                if (arg_count > MAX_ARGS) @panic("too many arguments");
-                if (stack.sp < arg_count + 1) @panic("stack underflow in call");
-                var args: [MAX_ARGS]abi.Value = undefined;
-                for (0..arg_count) |i| args[i] = stack.values[stack.sp - arg_count + i];
-                const fn_value = stack.values[stack.sp - arg_count - 1];
-                stack.sp -= arg_count + 1;
-                if (fn_value.tag != abi.TAG_FUNCTION) @panic("call of a non-function value");
-                const fo: *FunctionObject = @ptrFromInt(@as(usize, @bitCast(fn_value.payload)));
-                if (fo.index >= functions.len) @panic("function index out of range");
-                const entry = functions[fo.index];
-                if (fp >= MAX_FRAMES) @panic("call stack overflow");
-                const base = locals_top;
-                locals_top += entry.local_count;
-                if (locals_top > LOCAL_CAPACITY) @panic("too many locals");
-                for (0..entry.local_count) |i| cells[base + i] = null;
-                for (0..entry.arity) |i| {
-                    // Missing arguments read as `undefined` (JS semantics).
-                    locals[base + i] = if (i < arg_count) args[i] else abi.Value.UNDEF;
-                }
-                frames[fp] = .{
-                    .return_pc = pc,
-                    .stack_base = stack.sp,
-                    .locals_base = base,
-                    .function = fo,
-                };
-                fp += 1;
-                pc = entry.start;
-            },
-
-            abi.OP_RETURN => {
-                const frame = frames[fp - 1];
-                const value = if (stack.sp > frame.stack_base) stack.pop() else abi.Value.UNDEF;
-                fp -= 1;
-                stack.sp = frame.stack_base;
-                locals_top = frame.locals_base;
-                if (fp == 0) return value; // returned from the main frame
-                pc = frame.return_pc;
-                stack.push(value);
-            },
-            else => @panic("unknown opcode"),
-        }
-    }
-
-    return stack.top();
+    resetArena();
+    var machine = Machine.init(instructions, pool, functions);
+    return machine.execute();
 }
 
 pub export fn r8_machine_run(
@@ -361,17 +552,21 @@ pub export fn r8_machine_run(
     return run(instructions[0..len], pool[0..pool_len], functions[0..functions_len]);
 }
 
-fn binaryArithmetic(kind: Arithmetic, stack: *Stack) void {
-    const right = stack.pop();
-    const left = stack.pop();
-    stack.push(arithmetic(kind, left, right));
+fn binaryArithmetic(kind: Arithmetic, machine: *Machine) void {
+    const right = machine.stack.pop();
+    const left = machine.stack.pop();
+    machine.stack.push(arithmetic(kind, left, right));
 }
 
 fn arithmetic(kind: Arithmetic, left: abi.Value, right: abi.Value) abi.Value {
     switch (kind) {
         .add, .sub, .mul => {
-            // JS `+` concatenates when either operand is a string.
-            if (kind == .add and (left.tag == abi.TAG_STRING or right.tag == abi.TAG_STRING)) {
+            // JS `+` concatenates when either operand is a string, array,
+            // or object (ToPrimitive with the string default).
+            if (kind == .add and isConcatOperand(left)) {
+                return concatValues(left, right);
+            }
+            if (kind == .add and isConcatOperand(right)) {
                 return concatValues(left, right);
             }
             if (left.tag == abi.TAG_INT and right.tag == abi.TAG_INT) {
@@ -408,11 +603,30 @@ fn arithmetic(kind: Arithmetic, left: abi.Value, right: abi.Value) abi.Value {
     }
 }
 
-/// JS string coercion: strings pass through, everything else renders like
-/// `String()`. The returned bytes are either borrowed from the value's own
-/// memory or freshly arena-allocated.
+fn isConcatOperand(value: abi.Value) bool {
+    return value.tag == abi.TAG_STRING or
+        value.tag == abi.TAG_ARRAY or
+        value.tag == abi.TAG_OBJECT;
+}
+
+/// JS string coercion: strings pass through, arrays join like `String()`,
+/// everything else renders like `String()`. The returned bytes are either
+/// borrowed from the value's own memory or freshly arena-allocated.
 fn stringBytesOf(value: abi.Value) []const u8 {
     if (value.tag == abi.TAG_STRING) return value.asString().?;
+    if (value.tag == abi.TAG_ARRAY) {
+        // Join with ","; nested elements stringify recursively, with
+        // null/undefined rendering empty.
+        const array = value.asArray().?;
+        var joined = std.ArrayList(u8).empty;
+        for (0..array.len) |i| {
+            if (i > 0) joined.appendSlice(machineAllocator(), ",") catch @panic("out of memory");
+            const element = array.items[i];
+            if (element.tag == abi.TAG_NULL or element.tag == abi.TAG_UNDEFINED) continue;
+            joined.appendSlice(machineAllocator(), stringBytesOf(element)) catch @panic("out of memory");
+        }
+        return joined.items;
+    }
     var buffer: [96]u8 = undefined;
     const formatted = formatValue(value, &buffer) catch @panic("string coercion failed");
     return machineAllocator().dupe(u8, formatted) catch @panic("out of memory");
@@ -428,10 +642,10 @@ fn concatValues(left: abi.Value, right: abi.Value) abi.Value {
     return allocStringFrom(data.ptr, data.len);
 }
 
-fn binaryCompare(kind: Compare, stack: *Stack) void {
-    const right = stack.pop();
-    const left = stack.pop();
-    stack.push(abi.Value.fromBool(compare(kind, left, right)));
+fn binaryCompare(kind: Compare, machine: *Machine) void {
+    const right = machine.stack.pop();
+    const left = machine.stack.pop();
+    machine.stack.push(abi.Value.fromBool(compare(kind, left, right)));
 }
 
 fn compare(kind: Compare, left: abi.Value, right: abi.Value) bool {
@@ -465,10 +679,10 @@ fn compare(kind: Compare, left: abi.Value, right: abi.Value) bool {
     };
 }
 
-fn binaryEquality(kind: Equality, stack: *Stack) void {
-    const right = stack.pop();
-    const left = stack.pop();
-    stack.push(abi.Value.fromBool(equals(kind, left, right)));
+fn binaryEquality(kind: Equality, machine: *Machine) void {
+    const right = machine.stack.pop();
+    const left = machine.stack.pop();
+    machine.stack.push(abi.Value.fromBool(equals(kind, left, right)));
 }
 
 fn equals(kind: Equality, left: abi.Value, right: abi.Value) bool {
@@ -480,6 +694,10 @@ fn equals(kind: Equality, left: abi.Value, right: abi.Value) bool {
     }
     if (left.tag == abi.TAG_STRING and right.tag == abi.TAG_STRING) {
         return std.mem.eql(u8, left.asString().?, right.asString().?);
+    }
+    // Objects (arrays, objects, functions, methods) compare by reference.
+    if (isReferenceKind(left) and isReferenceKind(right)) {
+        return left.tag == right.tag and left.payload == right.payload;
     }
     switch (kind) {
         .strict => {
@@ -502,6 +720,13 @@ fn equals(kind: Equality, left: abi.Value, right: abi.Value) bool {
     }
 }
 
+fn isReferenceKind(value: abi.Value) bool {
+    return value.tag == abi.TAG_ARRAY or
+        value.tag == abi.TAG_OBJECT or
+        value.tag == abi.TAG_FUNCTION or
+        value.tag == abi.TAG_METHOD;
+}
+
 fn isTruthy(value: abi.Value) bool {
     return switch (value.tag) {
         abi.TAG_INT => value.payload != 0,
@@ -512,7 +737,7 @@ fn isTruthy(value: abi.Value) bool {
         abi.TAG_BOOL => value.payload != 0,
         abi.TAG_STRING => value.asString().?.len != 0,
         abi.TAG_NULL, abi.TAG_UNDEFINED => false,
-        else => true, // objects are truthy; unknown tags err truthy
+        else => true, // arrays, objects, functions, methods are truthy
     };
 }
 
@@ -530,26 +755,190 @@ fn negate(value: abi.Value) abi.Value {
     }
 }
 
+/// JS GetV semantics for `receiver[key]` and `receiver.key`.
+fn getIndex(receiver: abi.Value, key: abi.Value) abi.Value {
+    switch (receiver.tag) {
+        abi.TAG_STRING => {
+            const bytes = receiver.asString().?;
+            if (key.tag == abi.TAG_INT) {
+                const index = key.payload;
+                if (index >= 0 and index < @as(i64, @intCast(charCount(bytes)))) {
+                    const start = charOffset(bytes, @intCast(index));
+                    // Re-slice from the offset; a char may be multi-byte.
+                    const rest = bytes[start..];
+                    const char_len = std.unicode.utf8ByteSequenceLength(rest[0]) catch 1;
+                    return allocString(rest[0..char_len]);
+                }
+                return abi.Value.UNDEF;
+            }
+            if (key.tag == abi.TAG_STRING) {
+                if (std.mem.eql(u8, key.asString().?, "length")) {
+                    return abi.Value.fromInt(@intCast(charCount(bytes)));
+                }
+            }
+            return abi.Value.UNDEF;
+        },
+        abi.TAG_ARRAY => {
+            const array = receiver.asArray().?;
+            if (key.tag == abi.TAG_INT) {
+                const index = key.payload;
+                if (index >= 0 and index < @as(i64, @intCast(array.len))) {
+                    return array.items[@intCast(index)];
+                }
+                return abi.Value.UNDEF;
+            }
+            if (key.tag == abi.TAG_STRING) {
+                const name = key.asString().?;
+                if (std.mem.eql(u8, name, "length")) {
+                    return abi.Value.fromInt(@intCast(array.len));
+                }
+                if (builtinByName(name)) |builtin| {
+                    return allocMethod(receiver, @backingInt(builtin));
+                }
+            }
+            return abi.Value.UNDEF;
+        },
+        abi.TAG_OBJECT => {
+            const object = receiver.asObject().?;
+            if (key.tag == abi.TAG_STRING) {
+                const name = key.asString().?;
+                const keys = object.keys[0..object.len];
+                for (keys, 0..) |property_key, i| {
+                    if (property_key.tag == abi.TAG_STRING and
+                        std.mem.eql(u8, property_key.asString().?, name))
+                    {
+                        return object.values[i];
+                    }
+                }
+            }
+            return abi.Value.UNDEF;
+        },
+        abi.TAG_NULL, abi.TAG_UNDEFINED => {
+            @panic("cannot read properties of null or undefined");
+        },
+        else => return abi.Value.UNDEF,
+    }
+}
+
+/// JS Set semantics for `receiver[key] = value`. Array element assignment
+/// grows the array with `undefined` fill; object assignment adds or
+/// overwrites. Non-index writes on arrays are not supported yet.
+fn setIndex(receiver: abi.Value, key: abi.Value, value: abi.Value) void {
+    switch (receiver.tag) {
+        abi.TAG_ARRAY => {
+            const array = receiver.asArray().?;
+            if (key.tag != abi.TAG_INT) return;
+            const index = key.payload;
+            if (index < 0) return;
+            const requested: usize = @intCast(index);
+            if (requested < array.len) {
+                array.items[requested] = value;
+                return;
+            }
+            // Grow with `undefined` fill, like JS.
+            const allocator = machineAllocator();
+            const grown = allocator.alloc(abi.Value, requested + 1) catch @panic("out of memory");
+            for (0..requested) |i| grown[i] = if (i < array.len) array.items[i] else abi.Value.UNDEF;
+            grown[requested] = value;
+            array.items = grown.ptr;
+            array.len = grown.len;
+        },
+        abi.TAG_OBJECT => {
+            const object = receiver.asObject().?;
+            if (key.tag != abi.TAG_STRING) return;
+            const name = key.asString().?;
+            const keys = object.keys[0..object.len];
+            for (keys, 0..) |property_key, i| {
+                if (property_key.tag == abi.TAG_STRING and
+                    std.mem.eql(u8, property_key.asString().?, name))
+                {
+                    object.values[i] = value;
+                    return;
+                }
+            }
+            // Append the property.
+            const allocator = machineAllocator();
+            const grown_keys = allocator.alloc(abi.Value, object.len + 1) catch @panic("out of memory");
+            const grown_values = allocator.alloc(abi.Value, object.len + 1) catch @panic("out of memory");
+            @memcpy(grown_keys[0..object.len], object.keys[0..object.len]);
+            @memcpy(grown_values[0..object.len], object.values[0..object.len]);
+            grown_keys[object.len] = key;
+            grown_values[object.len] = value;
+            object.keys = grown_keys.ptr;
+            object.values = grown_values.ptr;
+            object.len += 1;
+        },
+        abi.TAG_NULL, abi.TAG_UNDEFINED => {
+            @panic("cannot set properties of null or undefined");
+        },
+        else => {},
+    }
+}
+
+fn builtinByName(name: []const u8) ?Builtin {
+    if (std.mem.eql(u8, name, "map")) return .map;
+    if (std.mem.eql(u8, name, "join")) return .join;
+    return null;
+}
+
+fn charCount(bytes: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const length = std.unicode.utf8ByteSequenceLength(bytes[index]) catch 1;
+        index += length;
+        count += 1;
+    }
+    return count;
+}
+
+fn charOffset(bytes: []const u8, char_index: usize) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len and count < char_index) {
+        const length = std.unicode.utf8ByteSequenceLength(bytes[index]) catch 1;
+        index += length;
+        count += 1;
+    }
+    return index;
+}
+
 fn printValue(value: abi.Value) void {
     const io = std.Options.debug_io;
-    var buffer: [256]u8 = undefined;
+    var buffer: [512]u8 = undefined;
     var file_writer = std.Io.File.stdout().writer(io, &buffer);
     const writer = &file_writer.interface;
-    // Strings are written directly: they can exceed any fixed buffer.
-    if (value.tag == abi.TAG_STRING) {
-        writer.writeAll(value.asString() orelse "<string>") catch {};
-    } else {
-        var text: [96]u8 = undefined;
-        const formatted = formatValue(value, &text) catch return;
-        writer.writeAll(formatted) catch {};
-    }
+    writeValue(writer, value) catch {};
     writer.writeAll("\n") catch {};
     writer.flush() catch {};
 }
 
+/// Streams a value's `String()` rendering to a writer without a fixed-size
+/// limit (strings and nested arrays can be arbitrarily long).
+fn writeValue(writer: anytype, value: abi.Value) !void {
+    switch (value.tag) {
+        abi.TAG_STRING => writer.writeAll(value.asString() orelse "<string>") catch {},
+        abi.TAG_ARRAY => {
+            const array = value.asArray().?;
+            for (0..array.len) |i| {
+                if (i > 0) writer.writeAll(",") catch {};
+                const element = array.items[i];
+                if (element.tag == abi.TAG_NULL or element.tag == abi.TAG_UNDEFINED) continue;
+                writeValue(writer, element) catch {};
+            }
+        },
+        else => {
+            var text: [512]u8 = undefined;
+            const formatted = formatValue(value, &text) catch return;
+            writer.writeAll(formatted) catch {};
+        },
+    }
+}
+
 /// Formats a value the way JS `String()` does. Used by the `console.log`
 /// intrinsic and unit-tested directly; `buffer` must hold the longest
-/// possible rendering (96 bytes covers every current type).
+/// possible rendering (arrays can exceed any fixed buffer — the caller
+/// accepts truncation errors for very large arrays).
 pub fn formatValue(value: abi.Value, buffer: []u8) ![]const u8 {
     return switch (value.tag) {
         abi.TAG_INT => std.fmt.bufPrint(buffer, "{d}", .{value.payload}),
@@ -563,7 +952,32 @@ pub fn formatValue(value: abi.Value, buffer: []u8) ![]const u8 {
             @memcpy(buffer[0..bytes.len], bytes);
             break :blk buffer[0..bytes.len];
         },
-        abi.TAG_OBJECT => "[object]",
+        abi.TAG_FUNCTION => "[function]",
+        abi.TAG_OBJECT => "[object Object]",
+        abi.TAG_METHOD => "[method]",
+        abi.TAG_ARRAY => blk: {
+            const array = value.asArray().?;
+            // The join output lives in the first half of the buffer; element
+            // rendering gets the second half (recursion re-splits it), so
+            // the accumulating output cannot be clobbered.
+            const out = buffer[0 .. buffer.len / 2];
+            const scratch = buffer[buffer.len / 2 ..];
+            var length: usize = 0;
+            for (0..array.len) |i| {
+                if (i > 0) {
+                    if (length + 1 > out.len) break :blk error.StringTooLong;
+                    out[length] = ',';
+                    length += 1;
+                }
+                const element = array.items[i];
+                if (element.tag == abi.TAG_NULL or element.tag == abi.TAG_UNDEFINED) continue;
+                const text = formatValue(element, scratch) catch break :blk error.StringTooLong;
+                if (length + text.len > out.len) break :blk error.StringTooLong;
+                @memcpy(out[length..][0..text.len], text);
+                length += text.len;
+            }
+            break :blk out[0..length];
+        },
         else => std.fmt.bufPrint(buffer, "<value tag={d}>", .{value.tag}),
     };
 }
@@ -668,7 +1082,6 @@ test "interpreter adds" {
     const value = run(&instructions, &[_]abi.Value{}, &[_]abi.KeelFunction{});
     try std.testing.expectEqual(@as(?i64, 2), value.asInt());
 }
-
 test "arithmetic promotes and follows js semantics" {
     const expectInt = struct {
         fn call(instructions: []const abi.Instruction, expected: i64) !void {
@@ -1131,4 +1544,174 @@ test "formatValue matches js string conversion" {
         .{ .value = std.math.nan(f64), .expected = "NaN" },
     };
     for (cases) |case| try expect(abi.Value.fromFloat(case.value), case.expected);
+}
+
+test "array literals, length, and element access" {
+    const code = [_]abi.Instruction{
+        // [10, 20, 30]
+        .{ .op = abi.OP_LOAD_INT, .operand = 10 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 20 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 30 },
+        .{ .op = abi.OP_NEW_ARRAY, .operand = 3 },
+        // [1] -> 20 (keep a spare copy of the array for later reads)
+        .{ .op = abi.OP_DUP, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        // [9] -> undefined (out of range)
+        .{ .op = abi.OP_DUP, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 9 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        // .length -> 3, returned as the final value
+        .{ .op = abi.OP_DUP, .operand = 0 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    var length_name = abi.KeelString{ .ptr = "length".ptr, .len = 6 };
+    const pool = [_]abi.Value{.{
+        .tag = abi.TAG_STRING,
+        ._pad = 0,
+        .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&length_name)))),
+    }};
+    const value = run(&code, &pool, &[_]abi.KeelFunction{});
+    try std.testing.expectEqual(@as(?i64, 3), value.asInt());
+}
+
+test "array element assignment grows with undefined fill" {
+    // set_index keeps the receiver and pushes the assigned value back.
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_NEW_ARRAY, .operand = 0 },
+        // a[2] = 7 -> [arr, 7]; pop the value, keep the array
+        .{ .op = abi.OP_LOAD_INT, .operand = 2 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 7 },
+        .{ .op = abi.OP_SET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        // a[1] -> undefined (fill)
+        .{ .op = abi.OP_DUP, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&code, &[_]abi.Value{}, &[_]abi.KeelFunction{});
+    try std.testing.expectEqual(abi.TAG_UNDEFINED, value.tag);
+}
+
+test "object literals store and read properties" {
+    var key_a = abi.KeelString{ .ptr = "a".ptr, .len = 1 };
+    var key_b = abi.KeelString{ .ptr = "b".ptr, .len = 1 };
+    const pool = [_]abi.Value{
+        .{ .tag = abi.TAG_STRING, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&key_a)))) },
+        .{ .tag = abi.TAG_STRING, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&key_b)))) },
+    };
+    const instructions = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 1 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 2 },
+        .{ .op = abi.OP_NEW_OBJECT, .operand = 2 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 1 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&instructions, &pool, &[_]abi.KeelFunction{});
+    try std.testing.expectEqual(@as(?i64, 2), value.asInt());
+}
+
+test "map re-enters the interpreter for callbacks" {
+    // [1, 2, 3].map((x) => x * 2) -> [2, 4, 6]; check via [1].
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 2 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 3 },
+        .{ .op = abi.OP_NEW_ARRAY, .operand = 3 },
+        // .map -> method value (receiver + "map")
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        // callback: function (x) { return x * 2; } at table index 1
+        .{ .op = abi.OP_CLOSURE, .operand = 1 },
+        .{ .op = abi.OP_CALL, .operand = 1 },
+        // result[1] -> 4
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+        // function (x) { return x * 2; }
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 2 },
+        .{ .op = abi.OP_MUL, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    var map_name = abi.KeelString{ .ptr = "map".ptr, .len = 3 };
+    const pool = [_]abi.Value{.{
+        .tag = abi.TAG_STRING,
+        ._pad = 0,
+        .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&map_name)))),
+    }};
+    const functions = [_]abi.KeelFunction{
+        .{ .start = 0, .len = 11, .local_count = 0, .arity = 0 },
+        .{ .start = 11, .len = 4, .local_count = 1, .arity = 1 },
+    };
+    const value = run(&code, &pool, &functions);
+    try std.testing.expectEqual(@as(?i64, 4), value.asInt());
+}
+
+test "join concatenates elements with the separator" {
+    var join_name = abi.KeelString{ .ptr = "join".ptr, .len = 4 };
+    var dash = abi.KeelString{ .ptr = "-".ptr, .len = 1 };
+    const pool = [_]abi.Value{
+        .{ .tag = abi.TAG_STRING, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&join_name)))) },
+        .{ .tag = abi.TAG_STRING, ._pad = 0, .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&dash)))) },
+    };
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_INT, .operand = 1 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 2 },
+        .{ .op = abi.OP_NEW_ARRAY, .operand = 2 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 }, // .join
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 1 }, // "-"
+        .{ .op = abi.OP_CALL, .operand = 1 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&code, &pool, &[_]abi.KeelFunction{});
+    try std.testing.expectEqualStrings("1-2", value.asString().?);
+}
+
+test "arrays format like String() and compare by reference" {
+    var buffer: [64]u8 = undefined;
+    const text = try formatValue(abi.Value.fromFloat(1.5), &buffer);
+    try std.testing.expectEqualStrings("1.5", text);
+}
+
+test "compound object property assignment via machine" {
+    var key_n = abi.KeelString{ .ptr = "n".ptr, .len = 1 };
+    const pool = [_]abi.Value{.{
+        .tag = abi.TAG_STRING,
+        ._pad = 0,
+        .payload = @bitCast(@as(i64, @intCast(@intFromPtr(&key_n)))),
+    }};
+    // o.n += 5 with the compiler's shape: get; dup; key; get; load; add;
+    // key; set; pop
+    const code = [_]abi.Instruction{
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 10 },
+        .{ .op = abi.OP_NEW_OBJECT, .operand = 1 },
+        .{ .op = abi.OP_SET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_DUP, .operand = 0 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_LOAD_INT, .operand = 5 },
+        .{ .op = abi.OP_ADD, .operand = 0 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_SET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        .{ .op = abi.OP_POP, .operand = 0 },
+        .{ .op = abi.OP_GET_LOCAL, .operand = 0 },
+        .{ .op = abi.OP_LOAD_STRING, .operand = 0 },
+        .{ .op = abi.OP_GET_INDEX, .operand = 0 },
+        .{ .op = abi.OP_RETURN, .operand = 0 },
+    };
+    const value = run(&code, &pool, &[_]abi.KeelFunction{});
+    try std.testing.expectEqual(@as(?i64, 15), value.asInt());
 }
