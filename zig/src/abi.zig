@@ -3,11 +3,12 @@
 //! strings (TAG_STRING, constant pool, LOAD_STRING/TO_STRING); ABI v5 adds
 //! functions (TAG_FUNCTION, function table, closure/capture opcodes); ABI v6
 //! adds arrays and objects (TAG_ARRAY, TAG_OBJECT, TAG_METHOD, property
-//! access); ABI v7 adds exceptions (TRY_ENTER/TRY_EXIT/THROW, err_out).
+//! access); ABI v7 adds exceptions (TRY_ENTER/TRY_EXIT/THROW, err_out);
+//! ABI v9 adds prototype chains (KeelObject.proto, OP_INSTANCEOF).
 
 const std = @import("std");
 
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 
 /// Value tags. Mirrors `crates/r8-abi`'s constants; the `CONFORMANCE_TAGS`
 /// table below lists them in the same canonical order — keep both in sync.
@@ -162,6 +163,9 @@ pub const OP_GLOBAL_GET: u32 = 61;
 /// Pops a value; assigns it to global `operand` (a string-pool name) and
 /// pushes it back (sloppy-mode global creation).
 pub const OP_GLOBAL_SET: u32 = 62;
+/// Pops a constructor function and a value; pushes whether the value's
+/// prototype chain contains the constructor's `prototype` object.
+pub const OP_INSTANCEOF: u32 = 63;
 
 /// Canonical tag order mirrored from `crates/r8-abi`'s `CONFORMANCE_TAGS`.
 const CONFORMANCE_TAGS = [_]u32{ TAG_INT, TAG_OBJECT, TAG_FLOAT, TAG_BOOL, TAG_NULL, TAG_UNDEFINED, TAG_STRING, TAG_FUNCTION, TAG_ARRAY, TAG_METHOD };
@@ -231,6 +235,7 @@ const CONFORMANCE_OPS = [_]u32{
     OP_NEW,
     OP_GLOBAL_GET,
     OP_GLOBAL_SET,
+    OP_INSTANCEOF,
 };
 
 pub const Value = extern struct {
@@ -356,11 +361,13 @@ pub const KeelArray = extern struct {
     len: usize,
 };
 
-/// An object's parallel key/value storage; mirrors `KeelObject`.
+/// An object's parallel key/value storage with a prototype link; mirrors
+/// `KeelObject`.
 pub const KeelObject = extern struct {
     keys: [*]Value,
     values: [*]Value,
     len: usize,
+    proto: ?*KeelObject,
 };
 
 /// A bound builtin method; mirrors `KeelMethod`.
@@ -374,7 +381,7 @@ comptime {
     if (@alignOf(Value) != 8) @compileError("Value must align to 8");
     if (@sizeOf(Instruction) != 8) @compileError("Instruction must be 8 bytes");
     if (CONFORMANCE_TAGS.len != 10) @compileError("CONFORMANCE_TAGS order must match crates/r8-abi");
-    if (CONFORMANCE_OPS.len != 62) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
+    if (CONFORMANCE_OPS.len != 63) @compileError("CONFORMANCE_OPS order must match crates/r8-abi");
 }
 
 pub export fn r8_abi_version() u32 {

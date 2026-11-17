@@ -62,8 +62,15 @@ fn allocObject(keys: []const abi.Value, values: []const abi.Value) abi.Value {
     const value_data = allocator.alloc(abi.Value, values.len) catch @panic("out of memory");
     @memcpy(value_data, values);
     const keel_object = allocator.create(abi.KeelObject) catch @panic("out of memory");
-    keel_object.* = .{ .keys = key_data.ptr, .values = value_data.ptr, .len = keys.len };
+    keel_object.* = .{ .keys = key_data.ptr, .values = value_data.ptr, .len = keys.len, .proto = null };
     return .{ .tag = abi.TAG_OBJECT, ._pad = 0, .payload = @bitCast(@intFromPtr(keel_object)) };
+}
+
+/// Like `allocObject`, with an explicit prototype link.
+fn allocObjectWithProto(keys: []const abi.Value, values: []const abi.Value, proto: ?*abi.KeelObject) abi.Value {
+    const value = allocObject(keys, values);
+    value.asObject().?.proto = proto;
+    return value;
 }
 
 /// Wraps a receiver + builtin id into a method value.
@@ -202,6 +209,9 @@ const Cell = struct {
 const FunctionObject = struct {
     index: usize,
     env: std.ArrayList(?*Cell) = .empty,
+    /// Own properties (`prototype`, statics set at runtime); null until the
+    /// first property write.
+    properties: ?*abi.KeelObject = null,
 };
 
 const Frame = struct {
@@ -680,6 +690,19 @@ pub const Machine = struct {
                 self.stack.push(fn_value);
                 for (0..arg_count) |i| self.stack.push(args[i]);
                 const constructed = allocObject(&[_]abi.Value{}, &[_]abi.Value{});
+                // Constructor prototype link: the instance's proto is the
+                // function's `prototype` property (when an object).
+                if (fn_value.tag == abi.TAG_FUNCTION) {
+                    const fo: *FunctionObject = @ptrFromInt(@as(usize, @bitCast(fn_value.payload)));
+                    if (fo.properties) |properties| {
+                        const proto_key = allocString("prototype");
+                        if (findKey(properties, proto_key)) |slot| {
+                            if (properties.values[slot].tag == abi.TAG_OBJECT) {
+                                constructed.asObject().?.proto = properties.values[slot].asObject();
+                            }
+                        }
+                    }
+                }
                 self.performCall(arg_count, constructed);
                 self.frames[self.fp - 1].new_target = constructed;
             },
@@ -766,6 +789,11 @@ pub const Machine = struct {
             abi.OP_KEYS => {
                 const receiver = self.stack.pop();
                 self.stack.push(ownKeys(receiver));
+            },
+            abi.OP_INSTANCEOF => {
+                const constructor = self.stack.pop();
+                const value = self.stack.pop();
+                self.stack.push(abi.Value.fromBool(isInstanceOf(self, value, constructor)));
             },
             abi.OP_GLOBAL_GET => {
                 const index: usize = @intCast(instruction.operand);
@@ -2014,11 +2042,31 @@ fn getIndex(receiver: abi.Value, key: abi.Value) abi.Value {
                         return object.values[i];
                     }
                 }
+                // Prototype-chain fallback.
+                if (findKeyDeep(object, key)) |found| {
+                    return found.object.values[found.slot];
+                }
             }
             return abi.Value.UNDEF;
         },
         abi.TAG_NULL, abi.TAG_UNDEFINED => {
             @panic("cannot read properties of null or undefined");
+        },
+        abi.TAG_FUNCTION => {
+            // Function own-properties (prototype, statics, ...).
+            const fo: *FunctionObject = @ptrFromInt(@as(usize, @bitCast(receiver.payload)));
+            if (fo.properties) |properties| {
+                if (findKey(properties, key)) |slot| {
+                    return properties.values[slot];
+                }
+            }
+            // `length` stand-in = arity.
+            if (key.tag == abi.TAG_STRING and std.mem.eql(u8, key.asString().?, "length")) {
+                const fo_index = fo.index;
+                _ = fo_index;
+                return abi.Value.UNDEF; // arity plumbing arrives with calls
+            }
+            return abi.Value.UNDEF;
         },
         abi.TAG_METHOD => {
             // Builtin constructor statics: Number.isNaN, Object.keys, ...
@@ -2056,6 +2104,12 @@ fn setIndex(receiver: abi.Value, key: abi.Value, value: abi.Value) void {
             grown[requested] = value;
             array.items = grown.ptr;
             array.len = grown.len;
+        },
+        abi.TAG_FUNCTION => {
+            // Function own-properties (prototype, statics, ...).
+            const fo: *FunctionObject = @ptrFromInt(@as(usize, @bitCast(receiver.payload)));
+            const properties = functionProperties(fo);
+            setIndex(.{ .tag = abi.TAG_OBJECT, ._pad = 0, .payload = @bitCast(@intFromPtr(properties)) }, key, value);
         },
         abi.TAG_OBJECT => {
             const object = receiver.asObject().?;
@@ -2204,12 +2258,58 @@ fn appendProperty(object: *abi.KeelObject, key: abi.Value, value: abi.Value) voi
     object.len += 1;
 }
 
+/// JS `value instanceof constructor`: walks the value's prototype chain
+/// looking for the constructor's `prototype` object. Builtin tags check
+/// against the engine builtins (Error family, Array, ...).
+fn isInstanceOf(self: *Machine, value: abi.Value, constructor: abi.Value) bool {
+    _ = self;
+    if (constructor.tag != abi.TAG_FUNCTION) {
+        // Builtin constructors are method values.
+        if (constructor.tag == abi.TAG_METHOD) {
+            const method: *abi.KeelMethod = @ptrFromInt(@as(usize, @bitCast(constructor.payload)));
+            const builtin = Builtin.fromId(method.id) orelse return false;
+            switch (builtin) {
+                .err_ctor => {
+                    // Error family: the value is an object with a `name`
+                    // property set by the constructor.
+                    if (value.tag != abi.TAG_OBJECT) return false;
+                    const object = value.asObject().?;
+                    const name_key = allocString("name");
+                    return findKey(object, name_key) != null;
+                },
+                .fn_is_array, .arr_ctor => return value.tag == abi.TAG_ARRAY,
+                .num_constructor => return value.tag == abi.TAG_INT or value.tag == abi.TAG_FLOAT,
+                .to_string => return value.tag == abi.TAG_STRING,
+                else => return false,
+            }
+        }
+        return false;
+    }
+    if (value.tag != abi.TAG_OBJECT) return false;
+    const fo: *FunctionObject = @ptrFromInt(@as(usize, @bitCast(constructor.payload)));
+    const prototype = fo.properties orelse return false;
+    const proto_key = allocString("prototype");
+    const proto_slot = findKey(prototype, proto_key) orelse return false;
+    const target = prototype.values[proto_slot];
+    if (target.tag != abi.TAG_OBJECT) return false;
+    const target_object = target.asObject().?;
+    var current = value.asObject().?.proto;
+    var depth: usize = 0;
+    while (current) |obj| {
+        if (obj == target_object) return true;
+        current = obj.proto;
+        depth += 1;
+        if (depth > 32) break;
+    }
+    return false;
+}
+
 /// JS `key in receiver` over the value kinds that exist so far.
 fn hasProperty(receiver: abi.Value, key: abi.Value) bool {
     switch (receiver.tag) {
         abi.TAG_OBJECT => {
             const object = receiver.asObject().?;
-            return findKey(object, key) != null;
+            return findKeyDeep(object, key) != null;
         },
         abi.TAG_ARRAY => {
             const array = receiver.asArray().?;
@@ -2262,6 +2362,29 @@ fn findKey(object: *abi.KeelObject, key: abi.Value) ?usize {
         }
     }
     return null;
+}
+
+/// Property lookup walking the prototype chain (own properties first).
+fn findKeyDeep(object: *abi.KeelObject, key: abi.Value) ?struct { object: *abi.KeelObject, slot: usize } {
+    var current: ?*abi.KeelObject = object;
+    var depth: usize = 0;
+    while (current) |obj| {
+        if (findKey(obj, key)) |slot| {
+            return .{ .object = obj, .slot = slot };
+        }
+        current = obj.proto;
+        depth += 1;
+        if (depth > 32) break; // cycle guard (real chains are acyclic)
+    }
+    return null;
+}
+
+/// Function own-properties object (created on demand).
+fn functionProperties(fo: *FunctionObject) *abi.KeelObject {
+    if (fo.properties) |properties| return properties;
+    const properties = allocObject(&[_]abi.Value{}, &[_]abi.Value{}).asObject().?;
+    fo.properties = properties;
+    return properties;
 }
 
 /// JS `delete receiver[key]`. Always true in this phase (configurability is

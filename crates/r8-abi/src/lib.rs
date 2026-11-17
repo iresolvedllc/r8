@@ -34,8 +34,12 @@
 //! ABI v8 adds the language-surface opcodes: `this` (bound to a per-run
 //! global object), `typeof`, the 32-bit bitwise/shift set, `in`, `delete`,
 //! and object key enumeration (for `for-in`).
+//!
+//! ABI v9 adds prototype chains: `KeelObject` gains a `proto` field (null =
+//! no prototype), property reads walk the chain, and `OP_INSTANCEOF`
+//! tests whether a constructor's prototype appears in a value's chain.
 
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 
 /// Value tags. `CONFORMANCE_TAGS` lists these in a canonical order; keep both
 /// in sync with `zig/src/abi.zig`.
@@ -190,6 +194,9 @@ pub const OP_GLOBAL_GET: u32 = 61;
 /// Pops a value; assigns it to global `operand` (a string-pool name) and
 /// pushes it back (sloppy-mode global creation).
 pub const OP_GLOBAL_SET: u32 = 62;
+/// Pops a constructor function and a value; pushes whether the value's
+/// prototype chain contains the constructor's `prototype` object.
+pub const OP_INSTANCEOF: u32 = 63;
 
 /// Canonical tag order mirrored by `zig/src/abi.zig` for conformance probes.
 /// New tags are appended at the end so existing indices stay stable.
@@ -271,6 +278,7 @@ pub const CONFORMANCE_OPS: &[u32] = &[
     OP_NEW,
     OP_GLOBAL_GET,
     OP_GLOBAL_SET,
+    OP_INSTANCEOF,
 ];
 
 #[repr(C)]
@@ -391,12 +399,14 @@ pub struct KeelArray {
 }
 
 /// An object's property storage: parallel key/value arrays of values (keys
-/// are `TAG_STRING` values), scanned linearly.
+/// are `TAG_STRING` values), scanned linearly, with a prototype link for
+/// property-read fallback (null = no prototype).
 #[repr(C)]
 pub struct KeelObject {
     pub keys: *mut Value,
     pub values: *mut Value,
     pub len: usize,
+    pub proto: *mut KeelObject,
 }
 
 /// A bound builtin method: which builtin, and the receiver it was read
@@ -796,6 +806,13 @@ impl Instruction {
         Self {
             op: OP_GLOBAL_SET,
             operand: name as i32,
+        }
+    }
+
+    pub const fn instanceof() -> Self {
+        Self {
+            op: OP_INSTANCEOF,
+            operand: 0,
         }
     }
 
